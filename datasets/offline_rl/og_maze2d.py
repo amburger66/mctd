@@ -7,7 +7,10 @@ import h5py
 from tqdm import tqdm
 import urllib
 import os
-import ogbench
+try:
+    import ogbench  # type: ignore
+except ModuleNotFoundError:
+    ogbench = None
 class OGMaze2dOfflineRLDataset(torch.utils.data.Dataset):
     '''
     Offline RL dataset for 2D maze environments from OG-Bench.
@@ -174,6 +177,13 @@ class OGMaze2dOfflineRLDataset(torch.utils.data.Dataset):
         return observation, action, reward, nonterminal
 
     def get_dataset(self):
+        if ogbench is None:
+            raise ModuleNotFoundError(
+                "Missing optional dependency `ogbench`. "
+                "OG-Bench datasets (maze2d/antmaze) require installing `ogbench` in the "
+                "runtime environment. PushBoundary training can proceed with "
+                "`pushboundary_offline` which does not use ogbench."
+            )
         _, train_dataset, val_dataset = ogbench.make_env_and_datasets(
             self.dataset_name,
             #self.save_dir, # Using default save_dir, "~/.ogbench/data"

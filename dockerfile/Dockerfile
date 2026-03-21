@@ -1,6 +1,6 @@
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.6.0-cudnn-devel-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
-ENV TZ=Korea/Seoul
+# ENV TZ=Korea/Seoul
 ENV PYTHONUNBUFFERED 1
 ENV PIP_DISABLE_PIP_VERSION_CHECK 1
 ENV PIP_NO_CACHE_DIR 1
@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --upgrade pip
 
 # Install libraries
-RUN pip3 install torch~=2.0.0
-RUN pip3 install torchvision~=0.15.1
+RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# RUN pip3 install torch~=2.0.0
+# RUN pip3 install torchvision~=0.15.1
 RUN pip3 install lightning~=2.1.2
 RUN pip3 install wandb~=0.17.0
 RUN pip3 install hydra-core~=1.3.2
@@ -54,32 +55,32 @@ RUN apt-get -y install libosmesa6-dev patchelf
 # Upgrade torchvision to remove warning msgs
 RUN pip3 install --upgrade torchvision
 
-# Copy the mujoco folder
-COPY ./mujoco/generated /usr/local/lib/python3.10/dist-packages/mujoco_py/generated
+# # Copy the mujoco folder
+# COPY ./mujoco/generated /usr/local/lib/python3.10/dist-packages/mujoco_py/generated
 
-# Give the authority to the user for the mujoco_py library
-RUN chmod -R 777 /usr/local/lib/python3.10/dist-packages/mujoco_py/generated
+# # Give the authority to the user for the mujoco_py library
+# RUN chmod -R 777 /usr/local/lib/python3.10/dist-packages/mujoco_py/generated
 
-# Install additional libraries for OGBench
-ENV MUJOCO_GL=egl
-RUN apt install -y mesa-utils
-COPY ./ogbench-1.0.1-py3-none-any.whl .
-RUN pip3 install ./ogbench-1.0.1-py3-none-any.whl
-RUN pip3 install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-RUN pip3 install moviepy==1.0.3 imageio-ffmpeg
+# # Install additional libraries for OGBench
+# ENV MUJOCO_GL=egl
+# RUN apt install -y mesa-utils
+# COPY ./ogbench-1.0.1-py3-none-any.whl .
+# RUN pip3 install ./ogbench-1.0.1-py3-none-any.whl
+# RUN pip3 install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+# RUN pip3 install moviepy==1.0.3 imageio-ffmpeg
 
-# New User (Optional)
-ARG UNAME=jsyoon
-ARG UID=1020
-ARG GID=1020
-RUN groupadd -g $GID -o $UNAME
-RUN useradd -m -u $UID -g $GID -o -s /bin/bash $UNAME
-USER $UNAME
-WORKDIR /home/$UNAME
+# # New User (Optional)
+# ARG UNAME=jsyoon
+# ARG UID=1020
+# ARG GID=1020
+# RUN groupadd -g $GID -o $UNAME
+# RUN useradd -m -u $UID -g $GID -o -s /bin/bash $UNAME
+# USER $UNAME
+# WORKDIR /home/$UNAME
 
-# Copy the mujoco folder
-RUN mkdir -p /home/$UNAME/.mujoco/mujoco210
-COPY ./mujoco/mujoco210 /home/$UNAME/.mujoco/mujoco210
+# # Copy the mujoco folder
+# RUN mkdir -p /home/$UNAME/.mujoco/mujoco210
+# COPY ./mujoco/mujoco210 /home/$UNAME/.mujoco/mujoco210
 
-# Add LD_LIBRARY_PATH
-ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$UNAME/.mujoco/mujoco210/bin
+# # Add LD_LIBRARY_PATH
+# ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64:/home/$UNAME/.mujoco/mujoco210/bin

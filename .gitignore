@@ -9,6 +9,8 @@ datasets/offline_rl/viz
 jobs/
 dql_jobs/
 
+visualizations/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

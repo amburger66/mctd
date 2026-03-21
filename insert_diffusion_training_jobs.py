@@ -3,8 +3,8 @@ import copy
 import json
 from datetime import datetime
 
-wandb_entity = "jaesikyoon"
-wandb_project = "jaesik_mctd"
+wandb_entity = "r-pad"
+wandb_project = "mctd"
 
 configs = [
     #################################
@@ -67,7 +67,6 @@ configs = [
         "dataset": "og_maze2d_giant_navigate",
         "dataset.jump": 5,
     },
-
     #################################
     # AntMaze
     #################################
@@ -137,6 +136,8 @@ if not os.path.exists(jobs_folder):
 
 # Write the jobs with each config, which name is current time (Too quickly to be overwritten)
 for config in configs:
-    with open(f"{jobs_folder}/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json", "w") as f:
+    with open(
+        f"{jobs_folder}/{datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')}.json", "w"
+    ) as f:
         json.dump(config, f, indent=4)
-print(f"Generated validation {len(configs)} jobs")
+print(f"Generated training {len(configs)} jobs")

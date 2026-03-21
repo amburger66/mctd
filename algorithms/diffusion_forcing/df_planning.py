@@ -8,13 +8,14 @@ import torch.nn as nn
 from einops import rearrange, repeat, reduce
 import wandb
 from PIL import Image
+from pathlib import Path
 
 from .df_base import DiffusionForcingBase
 from utils.logging_utils import (
     make_trajectory_images,
     get_random_start_goal,
     make_convergence_animation,
-    make_mpc_animation
+    make_mpc_animation,
 )
 from .tree_node import TreeNode
 
@@ -37,7 +38,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.action_dim = len(cfg.action_mean)
         self.observation_dim = len(cfg.observation_mean)
         self.use_reward = cfg.use_reward
-        self.unstacked_dim = self.observation_dim + self.action_dim + int(self.use_reward)
+        self.unstacked_dim = (
+            self.observation_dim + self.action_dim + int(self.use_reward)
+        )
         cfg.x_shape = (self.unstacked_dim,)
         self.episode_len = cfg.episode_len
         self.n_tokens = self.episode_len // cfg.frame_stack + 1
@@ -74,6 +77,226 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
 
+    def _log_or_save_pushboundary_pcd_gif(
+        self,
+        namespace: str,
+        states: np.ndarray,
+        actions: np.ndarray,
+        sample_idx: int,
+        *,
+        num_frames: int = 8,
+        elev: float = 30.0,
+        azim: float = -60.0,
+        dpi: int = 100,
+        fps: float = 15.0,
+        ghost_alpha: float = 0.35,
+        show_ghost: bool = True,
+    ) -> None:
+        """
+        Render a low-dim PushBoundary (18D state / 9D action) trajectory snippet as a GIF.
+
+        Disk fallback is always used; wandb logging is best-effort only when a logger exists.
+        """
+
+        # Lazily import `scripts/vis_lowdim.py` (it's not a Python package).
+        if not hasattr(self, "_pushboundary_vl"):
+            import sys
+
+            repo_root = Path(__file__).resolve().parents[4]
+            scripts_dir = repo_root / "scripts"
+            if str(scripts_dir) not in sys.path:
+                sys.path.insert(0, str(scripts_dir))
+
+            import vis_lowdim as vis_lowdim  # type: ignore
+
+            self._pushboundary_vl = vis_lowdim
+
+        vl = self._pushboundary_vl
+
+        # Cache templates for Push-v1 cube block (use_T=False).
+        if not hasattr(self, "_pushboundary_templates"):
+            rng = np.random.default_rng(0)
+            # Defaults are larger than needed; keep them modest for training-step logging.
+            self._pushboundary_templates = vl.build_templates(
+                n_block=200, n_hand=120, rng=rng, use_T=False
+            )
+
+        templates = self._pushboundary_templates
+
+        if states.ndim != 2 or states.shape[-1] != self.observation_dim:
+            raise ValueError(
+                f"Expected `states` shape [T, {self.observation_dim}], got {states.shape}"
+            )
+        if actions.ndim != 2 or actions.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Expected `actions` shape [T, {self.action_dim}], got {actions.shape}"
+            )
+
+        T = states.shape[0]
+        if T <= 0:
+            return
+
+        k = int(min(num_frames, T))
+        if k <= 1:
+            step_indices = [0]
+        else:
+            step_indices = np.linspace(0, T - 1, num=k, dtype=int).tolist()
+
+        frames = [
+            vl.extract_frame(
+                states=states,
+                actions=actions,
+                step=int(s),
+                future_step=int(s),
+                templates=templates,
+            )
+            for s in step_indices
+        ]
+
+        lims = vl._scene_limits(frames)
+        frames_img = [
+            vl.render_frame_gif(
+                frame=frame,
+                step=int(s),
+                elev=elev,
+                azim=azim,
+                lims=lims,
+                dpi=dpi,
+                ghost_alpha=ghost_alpha,
+                show_ghost=show_ghost,
+            )
+            for frame, s in zip(frames, step_indices)
+        ]
+
+        # Disk output (always).
+        root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
+        out_dir = (
+            root_dir
+            / "visualizations"
+            / "pushboundary_pcd"
+            / namespace
+            / f"global_step_{self.global_step:07d}"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        gif_path = out_dir / f"sample_{sample_idx}.gif"
+        vl.save_gif(frames_img, str(gif_path), fps=fps)
+
+        # Best-effort wandb logging (don't re-render; just log a few frames).
+        if self.logger is not None:
+            try:
+                for j in {0, len(frames_img) // 2, len(frames_img) - 1}:
+                    img = frames_img[j]
+                    self.log_image(
+                        f"training_visualization_pcd/{namespace}/sample_{sample_idx}/frame_{j}",
+                        Image.fromarray(img),
+                    )
+            except Exception:
+                # Logging should never break training.
+                pass
+
+    def _log_or_save_pushboundary_2d_gif(
+        self,
+        namespace: str,
+        states: np.ndarray,
+        sample_idx: int,
+        *,
+        num_frames: int = 8,
+        dpi: int = 100,
+        fps: float = 15.0,
+    ) -> None:
+        """
+        Render a 2D PushBoundary trajectory [tcp_x, tcp_y, block_x, block_y] as a GIF.
+        """
+        if states.ndim != 2 or states.shape[-1] < 4:
+            return
+        tcp_xy = states[:, :2]
+        block_xy = states[:, 2:4]
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        pad = 0.02
+        x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
+        x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
+        y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
+        y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
+
+        T = states.shape[0]
+        k = min(num_frames, T)
+        step_indices = (
+            [0]
+            if k <= 1
+            else np.linspace(0, T - 1, num=k, dtype=int).tolist()
+        )
+
+        frames_img = []
+        for s in step_indices:
+            end = int(s) + 1
+            fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
+            ax.plot(
+                tcp_xy[:end, 0],
+                tcp_xy[:end, 1],
+                "o-",
+                color="#e63946",
+                markersize=2,
+                linewidth=1,
+                label="tcp",
+            )
+            ax.plot(
+                block_xy[:end, 0],
+                block_xy[:end, 1],
+                "o-",
+                color="#0066ff",
+                markersize=2,
+                linewidth=1,
+                label="block",
+            )
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+            ax.set_aspect("equal")
+            ax.legend(loc="upper right", fontsize=7)
+            ax.set_title(f"step {s}", fontsize=8)
+            ax.set_xlabel("X", fontsize=7)
+            ax.set_ylabel("Y", fontsize=7)
+            fig.tight_layout(pad=0.3)
+            fig.canvas.draw()
+            w, h_px = fig.canvas.get_width_height()
+            buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+            img = buf.reshape(h_px, w, 4).copy()
+            frames_img.append(img)
+            plt.close(fig)
+
+        root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
+        out_dir = (
+            root_dir
+            / "visualizations"
+            / "pushboundary_2d"
+            / namespace
+            / f"global_step_{self.global_step:07d}"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        gif_path = out_dir / f"sample_{sample_idx}.gif"
+
+        repo_root = Path(__file__).resolve().parents[4]
+        scripts_dir = repo_root / "scripts"
+        import sys
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import vis_lowdim as vl
+        vl.save_gif(frames_img, str(gif_path), fps=fps)
+
+        if self.logger is not None:
+            try:
+                for j in {0, len(frames_img) // 2, len(frames_img) - 1}:
+                    if j < len(frames_img):
+                        self.log_image(
+                            f"training_visualization_2d/{namespace}/sample_{sample_idx}/frame_{j}",
+                            Image.fromarray(frames_img[j]),
+                        )
+            except Exception:
+                pass
+
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
         std = list(self.observation_std) + list(self.action_std)
@@ -92,9 +315,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         actions = actions[..., : self.action_dim]
 
         if (n_frames - 1) % self.frame_stack != 0:
-            raise ValueError("Number of frames - 1 must be divisible by frame stack size")
+            raise ValueError(
+                "Number of frames - 1 must be divisible by frame stack size"
+            )
 
-        nonterminals = torch.cat([torch.ones_like(nonterminals[:, : self.frame_stack]), nonterminals[:, :-1]], dim=1)
+        nonterminals = torch.cat(
+            [
+                torch.ones_like(nonterminals[:, : self.frame_stack]),
+                nonterminals[:, :-1],
+            ],
+            dim=1,
+        )
         nonterminals = nonterminals.bool().permute(1, 0)
         masks = torch.cumprod(nonterminals, dim=0).contiguous()
         # masks = torch.cat([masks[:-self.frame_stack:self.jump], masks[-self.frame_stack:]], dim=0)
@@ -102,9 +333,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         rewards = rewards[:, :-1, None]
         actions = actions[:, :-1]
         init_obs, observations = torch.split(observations, [1, n_frames - 1], dim=1)
-        bundles = self._normalize_x(self.make_bundle(observations, actions, rewards))  # (b t c)
+        bundles = self._normalize_x(
+            self.make_bundle(observations, actions, rewards)
+        )  # (b t c)
         init_bundle = self._normalize_x(self.make_bundle(init_obs[:, 0]))  # (b c)
-        init_bundle[:, self.observation_dim :] = 0  # zero out actions and rewards after normalization
+        init_bundle[:, self.observation_dim :] = (
+            0  # zero out actions and rewards after normalization
+        )
         init_bundle = self.pad_init(init_bundle, batch_first=True)  # (b t c)
         bundles = torch.cat([init_bundle, bundles], dim=1)
         bundles = rearrange(bundles, "b (t fs) ... -> t b fs ...", fs=self.frame_stack)
@@ -124,33 +359,79 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         weights = masks.float()
         if not self.causal:
             # manually mask out entries to train for varying length
-            random_terminal = torch.randint(2, n_tokens + 1, (batch_size,), device=self.device)
-            random_terminal = nn.functional.one_hot(random_terminal, n_tokens + 1)[:, :n_tokens].bool()
-            random_terminal = repeat(random_terminal, "b t -> (t fs) b", fs=self.frame_stack)
+            random_terminal = torch.randint(
+                2, n_tokens + 1, (batch_size,), device=self.device
+            )
+            random_terminal = nn.functional.one_hot(random_terminal, n_tokens + 1)[
+                :, :n_tokens
+            ].bool()
+            random_terminal = repeat(
+                random_terminal, "b t -> (t fs) b", fs=self.frame_stack
+            )
             nonterminal_causal = torch.cumprod(~random_terminal, dim=0)
             weights *= torch.clip(nonterminal_causal.float(), min=0.05)
             masks *= nonterminal_causal.bool()
 
-        xs_pred, loss = self.diffusion_model(xs, conditions, noise_levels=self._generate_noise_levels(xs, masks=masks))
+        xs_pred, loss = self.diffusion_model(
+            xs, conditions, noise_levels=self._generate_noise_levels(xs, masks=masks)
+        )
 
         loss = self.reweight_loss(loss, weights)
 
         if batch_idx % 100 == 0:
-            self.log("training/loss", loss, on_step=True, on_epoch=False, sync_dist=True)
+            self.log(
+                "training/loss",
+                loss,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+                prog_bar=True,
+            )
 
         xs = self._unstack_and_unnormalize(xs)[self.frame_stack - 1 :]
         xs_pred = self._unstack_and_unnormalize(xs_pred)[self.frame_stack - 1 :]
 
-        # Visualization, including masked out entries
-        if self.global_step % 10000 == 0:
+        # Visualization, including masked out entries.
+        # If wandb/logging is disabled, `self.logger` can be None.
+        if self.global_step % 100 == 0 and self.logger is not None:
             o, a, r = self.split_bundle(xs_pred)
-            trajectory = o.detach().cpu().numpy()[:-1, :8]  # last observation is dummy, sample 8
-            images = make_trajectory_images(self.env_id, trajectory, trajectory.shape[1], None, None, False)
+            trajectory = (
+                o.detach().cpu().numpy()[:-1, :8]
+            )  # last observation is dummy, sample 8
+            images = make_trajectory_images(
+                self.env_id, trajectory, trajectory.shape[1], None, None, False
+            )
             for i, img in enumerate(images):
                 self.log_image(
                     f"training_visualization/sample_{i}",
                     Image.fromarray(img),
                 )
+
+        # PushBoundary visualization (always saved to disk; wandb is best-effort).
+        if self.global_step % 10000 == 0:
+            o, a, _ = self.split_bundle(xs_pred)
+            o_np = o.detach().cpu().numpy()  # (t, b, obs_dim)
+            a_np = a.detach().cpu().numpy()  # (t, b, action_dim)
+
+            batch_size = o_np.shape[1]
+            samples = min(1, batch_size)  # keep it lightweight for training
+            for sample_idx in range(samples):
+                # last observation is dummy => drop it for both states and actions
+                states = o_np[:-1, sample_idx, :]
+                actions = a_np[:-1, sample_idx, :]
+                if self.observation_dim >= 18:
+                    self._log_or_save_pushboundary_pcd_gif(
+                        namespace="training",
+                        states=states,
+                        actions=actions,
+                        sample_idx=sample_idx,
+                    )
+                elif self.observation_dim >= 4:
+                    self._log_or_save_pushboundary_2d_gif(
+                        namespace="training",
+                        states=states,
+                        sample_idx=sample_idx,
+                    )
 
         output_dict = {
             "loss": loss,
@@ -167,10 +448,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if self.guidance_scale == 0:
             namespace += "_no_guidance_random_walk"
         horizon = self.episode_len
-        self.interact(batch_size, conditions, namespace)  # interact if environment is installation
+        self.interact(
+            batch_size, conditions, namespace
+        )  # interact if environment is installation
 
-    def plan(self, start: torch.Tensor, goal: torch.Tensor, horizon: int, conditions: Optional[Any] = None,
-        guidance_scale: int = None, noise_level: Optional[torch.Tensor] = None, plan: Optional[torch.Tensor] = None):
+    def plan(
+        self,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        horizon: int,
+        conditions: Optional[Any] = None,
+        guidance_scale: int = None,
+        noise_level: Optional[torch.Tensor] = None,
+        plan: Optional[torch.Tensor] = None,
+    ):
         # start and goal are numpy arrays of shape (b, obs_dim)
         # start and goal are assumed to be normalized
         # returns plan history of (m, t, b, c), where the last dim of m is the fully diffused plan
@@ -186,67 +477,94 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         def goal_guidance(x):
             # x is a tensor of shape [t b (fs c)]
             pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
+            h_padded = (
+                pred.shape[0] - self.frame_stack
+            )  # include padding when horizon % frame_stack != 0
 
             if not self.use_reward:
                 # sparse / no reward setting, guide with goal like diffuser
                 target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
-                dist = nn.functional.mse_loss(pred, target, reduction="none")  # (t fs) b c
+                dist = nn.functional.mse_loss(
+                    pred, target, reduction="none"
+                )  # (t fs) b c
                 # guidance weight for observation and action
                 weight = np.array(
-                    [20] * (self.frame_stack)  # conditoning (aka reconstruction guidance)
-
-                    + [1 for _ in range(horizon)]  # try to reach the goal at any horizon
-                    #+ [0 for _ in range(horizon-1)] + [1]  # Diffuer guidance
-                    + [0] * (h_padded - horizon)  # don't guide padded entries due to horizon % frame_stack != 0
+                    [20]
+                    * (self.frame_stack)  # conditoning (aka reconstruction guidance)
+                    + [
+                        1 for _ in range(horizon)
+                    ]  # try to reach the goal at any horizon
+                    # + [0 for _ in range(horizon-1)] + [1]  # Diffuer guidance
+                    + [0]
+                    * (
+                        h_padded - horizon
+                    )  # don't guide padded entries due to horizon % frame_stack != 0
                 )
                 # mathematically, one may also try multiplying weight by sqrt(alpha_cum)
                 # this means you put higher weight to less noisy terms
                 # which might be better but we haven't tried yet
                 weight = torch.from_numpy(weight).float().to(self.device)
-                
-                dist_o, dist_a, _ = self.split_bundle(dist)  # guidance observation and action with separate weights
+
+                dist_o, dist_a, _ = self.split_bundle(
+                    dist
+                )  # guidance observation and action with separate weights
                 dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = dist_o[:, :, : 2]
-                #dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2).sqrt()
+                dist_o = dist_o[:, :, :2]
+                # dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2).sqrt()
                 dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1).sqrt()
-                dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
-                #dist = torch.cat([dist_o, dist_a], -1)
+                dist_o = torch.tanh(
+                    dist_o / 2
+                )  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
+                # dist = torch.cat([dist_o, dist_a], -1)
                 dist = dist_o
                 weight = repeat(weight, "t -> t c", c=dist.shape[-1])
                 weight[self.frame_stack :, 1:] = 8
                 weight[: self.frame_stack, 1:] = 2
                 weight = torch.ones_like(dist) * weight[:, None]
 
-                episode_return = -(dist * weight).mean() * 1000 * dist.shape[1] / 16 # considering the batch size
+                episode_return = (
+                    -(dist * weight).mean() * 1000 * dist.shape[1] / 16
+                )  # considering the batch size
             else:
                 # dense reward seeting, guide with reward
-                raise NotImplementedError("reward guidance not officially supported yet, although implemented")
+                raise NotImplementedError(
+                    "reward guidance not officially supported yet, although implemented"
+                )
                 rewards = pred[:, :, -1]
-                weight = np.array([10] * self.frame_stack + [0.997**j for j in range(h)] + [0] * h_padded)
+                weight = np.array(
+                    [10] * self.frame_stack
+                    + [0.997**j for j in range(h)]
+                    + [0] * h_padded
+                )
                 weight = torch.from_numpy(weight).float().to(self.device)
                 episode_return = rewards * weight[:, None]
 
-            #return self.guidance_scale * episode_return
+            # return self.guidance_scale * episode_return
             return guidance_scale * episode_return
 
-        #guidance_fn = goal_guidance if self.guidance_scale else None
+        # guidance_fn = goal_guidance if self.guidance_scale else None
         guidance_fn = goal_guidance if guidance_scale else None
 
         plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
         pad_tokens = 0 if self.causal else self.n_tokens - plan_tokens - 1
-        #pad_tokens = 0 # To be more efficient
+        # pad_tokens = 0 # To be more efficient
         if noise_level is None:
             scheduling_matrix = self._generate_scheduling_matrix(plan_tokens)
-        else: # if noise_level is given, use it
+        else:  # if noise_level is given, use it
             scheduling_matrix = noise_level
         if plan is None:
-            chunk = torch.randn((plan_tokens, batch_size, *self.x_stacked_shape), device=self.device)
-            chunk = torch.clamp(chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
-        else: # if plan is given, use it
+            chunk = torch.randn(
+                (plan_tokens, batch_size, *self.x_stacked_shape), device=self.device
+            )
+            chunk = torch.clamp(
+                chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise
+            )
+        else:  # if plan is given, use it
             chunk = plan
             chunk = rearrange(chunk, "(t fs) b c -> t b (fs c)", fs=self.frame_stack)
-        pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
+        pad = torch.zeros(
+            (pad_tokens, batch_size, *self.x_stacked_shape), device=self.device
+        )
         init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
         plan = torch.cat([init_token, chunk, pad], 0)
 
@@ -272,18 +590,32 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             from_noise_levels = repeat(from_noise_levels, "t -> t b", b=batch_size)
             to_noise_levels = repeat(to_noise_levels, "t -> t b", b=batch_size)
             plan[1 : self.n_tokens - pad_tokens] = self.diffusion_model.sample_step(
-                plan, conditions, from_noise_levels, to_noise_levels, guidance_fn=guidance_fn
+                plan,
+                conditions,
+                from_noise_levels,
+                to_noise_levels,
+                guidance_fn=guidance_fn,
             )[1 : self.n_tokens - pad_tokens]
             plan_hist.append(plan.detach().clone()[: self.n_tokens - pad_tokens])
 
         plan_hist = torch.stack(plan_hist)
-        plan_hist = rearrange(plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack)
+        plan_hist = rearrange(
+            plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack
+        )
         plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
 
         return plan_hist
 
-    def parallel_plan(self, start: torch.Tensor, goal: torch.Tensor, horizon: int, conditions: Optional[Any] = None,
-        guidance_scale: int = None, noise_level: Optional[torch.Tensor] = None, plan: Optional[torch.Tensor] = None):
+    def parallel_plan(
+        self,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        horizon: int,
+        conditions: Optional[Any] = None,
+        guidance_scale: int = None,
+        noise_level: Optional[torch.Tensor] = None,
+        plan: Optional[torch.Tensor] = None,
+    ):
         # start and goal are numpy arrays of shape (b, obs_dim)
         # start and goal are assumed to be normalized
         # returns plan history of (m, t, b, c), where the last dim of m is the fully diffused plan
@@ -291,7 +623,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         batch_size = len(plan)
         start = torch.cat([start] * batch_size, 0)
-        goal = torch.cat([goal] * batch_size, 0)            
+        goal = torch.cat([goal] * batch_size, 0)
 
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
@@ -299,36 +631,53 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         def goal_guidance(x):
             # x is a tensor of shape [t b (fs c)]
             pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
-            h_padded = pred.shape[0] - self.frame_stack  # include padding when horizon % frame_stack != 0
+            h_padded = (
+                pred.shape[0] - self.frame_stack
+            )  # include padding when horizon % frame_stack != 0
 
             if not self.use_reward:
                 # sparse / no reward setting, guide with goal like diffuser
                 target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
-                dist = nn.functional.mse_loss(pred, target, reduction="none")  # (t fs) b c
+                dist = nn.functional.mse_loss(
+                    pred, target, reduction="none"
+                )  # (t fs) b c
 
                 # guidance weight for observation and action
                 weight = np.array(
-                    [20] * (self.frame_stack)  # conditoning (aka reconstruction guidance)
-
-                    + [1 for _ in range(horizon)]  # try to reach the goal at any horizon
-                    #+ [0 for _ in range(horizon-1)] + [1]  # Diffuer guidance
-                    + [0] * (h_padded - horizon)  # don't guide padded entries due to horizon % frame_stack != 0
+                    [20]
+                    * (self.frame_stack)  # conditoning (aka reconstruction guidance)
+                    + [
+                        1 for _ in range(horizon)
+                    ]  # try to reach the goal at any horizon
+                    # + [0 for _ in range(horizon-1)] + [1]  # Diffuer guidance
+                    + [0]
+                    * (
+                        h_padded - horizon
+                    )  # don't guide padded entries due to horizon % frame_stack != 0
                 )
                 weight = torch.from_numpy(weight).float().to(self.device)
-                
-                dist_o, dist_a, _ = self.split_bundle(dist)  # guidance observation and action with separate weights
+
+                dist_o, dist_a, _ = self.split_bundle(
+                    dist
+                )  # guidance observation and action with separate weights
                 dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = dist_o[:, :, : 2]
+                dist_o = dist_o[:, :, :2]
                 dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1).sqrt()
-                dist_o = torch.tanh(dist_o / 2)  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
+                dist_o = torch.tanh(
+                    dist_o / 2
+                )  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
                 dist = dist_o
                 weight = repeat(weight, "t -> t c", c=dist.shape[-1])
                 weight[self.frame_stack :, 1:] = 8
                 weight[: self.frame_stack, 1:] = 2
                 weight = torch.ones_like(dist) * weight[:, None]
-                episode_return = -(dist * weight).mean(dim=(0, 2)) * 1000 * dist.shape[1] / 16
+                episode_return = (
+                    -(dist * weight).mean(dim=(0, 2)) * 1000 * dist.shape[1] / 16
+                )
             else:
-                raise NotImplementedError("reward guidance not officially supported yet, although implemented")
+                raise NotImplementedError(
+                    "reward guidance not officially supported yet, although implemented"
+                )
 
             return (guidance_scale * episode_return).mean()
 
@@ -340,9 +689,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             scheduling_matrix = noise_level
         except:
             raise ValueError("noise_level is required for parallel planning")
-        # if None in plan: 
+        # if None in plan:
         #     chunk = torch.randn((plan_tokens, batch_size, *self.x_stacked_shape), device=self.device)
-        #     chunk = torch.clamp(chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise) 
+        #     chunk = torch.clamp(chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
         # else:
         #     chunk = torch.stack(plan).squeeze(dim=2)
         #     chunk = rearrange(chunk, "b (t fs) c -> t b (fs c)", fs=self.frame_stack) # 5, 500, 2 =>  50, 5, 20
@@ -350,15 +699,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         chunk = []
         for i in range(batch_size):
             if plan[i] == None:
-                c = torch.randn((plan_tokens, 1, *self.x_stacked_shape), device=self.device)
-                c = torch.clamp(c, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise)
+                c = torch.randn(
+                    (plan_tokens, 1, *self.x_stacked_shape), device=self.device
+                )
+                c = torch.clamp(
+                    c, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise
+                )
             else:
                 c = rearrange(plan[i], "(t fs) 1 c -> t 1 (fs c)", fs=self.frame_stack)
             chunk.append(c)
         chunk = torch.cat(chunk, 1)
         if len(chunk.shape) == 2:
             chunk = chunk.unsqueeze(0)
-        pad = torch.zeros((pad_tokens, batch_size, *self.x_stacked_shape), device=self.device)
+        pad = torch.zeros(
+            (pad_tokens, batch_size, *self.x_stacked_shape), device=self.device
+        )
         init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
         plan = torch.cat([init_token, chunk, pad], 0)
 
@@ -368,31 +723,49 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         for m in range(scheduling_matrix.shape[1] - 1):
             from_noise_levels = np.concatenate(
                 [
-                    np.full((batch_size, 1), stabilization, dtype=np.int64),  # Shape (batch_size, 1)
-                    scheduling_matrix[:,m],
-                    np.full((batch_size, pad_tokens), self.sampling_timesteps, dtype=np.int64),  # Shape (batch_size, pad_tokens)
-                ]
-                , axis=1
+                    np.full(
+                        (batch_size, 1), stabilization, dtype=np.int64
+                    ),  # Shape (batch_size, 1)
+                    scheduling_matrix[:, m],
+                    np.full(
+                        (batch_size, pad_tokens),
+                        self.sampling_timesteps,
+                        dtype=np.int64,
+                    ),  # Shape (batch_size, pad_tokens)
+                ],
+                axis=1,
             )
             to_noise_levels = np.concatenate(
                 [
-                    np.full((batch_size, 1), stabilization, dtype=np.int64),  # Shape (batch_size, 1)
-                    scheduling_matrix[:,m+1],
-                    np.full((batch_size, pad_tokens), self.sampling_timesteps, dtype=np.int64),  # Shape (batch_size, pad_tokens)
-                ]
-                , axis=1
+                    np.full(
+                        (batch_size, 1), stabilization, dtype=np.int64
+                    ),  # Shape (batch_size, 1)
+                    scheduling_matrix[:, m + 1],
+                    np.full(
+                        (batch_size, pad_tokens),
+                        self.sampling_timesteps,
+                        dtype=np.int64,
+                    ),  # Shape (batch_size, pad_tokens)
+                ],
+                axis=1,
             )
             from_noise_levels = torch.from_numpy(from_noise_levels).to(self.device)
             to_noise_levels = torch.from_numpy(to_noise_levels).to(self.device)
             from_noise_levels = rearrange(from_noise_levels, "b t -> t b", b=batch_size)
             to_noise_levels = rearrange(to_noise_levels, "b t -> t b", b=batch_size)
             plan[1 : self.n_tokens - pad_tokens] = self.diffusion_model.sample_step(
-                plan, conditions, from_noise_levels, to_noise_levels, guidance_fn=guidance_fn
+                plan,
+                conditions,
+                from_noise_levels,
+                to_noise_levels,
+                guidance_fn=guidance_fn,
             )[1 : self.n_tokens - pad_tokens]
             plan_hist.append(plan.detach().clone()[: self.n_tokens - pad_tokens])
 
         plan_hist = torch.stack(plan_hist)
-        plan_hist = rearrange(plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack)
+        plan_hist = rearrange(
+            plan_hist, "m t b (fs c) -> m (t fs) b c", fs=self.frame_stack
+        )
         plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
         return plan_hist
 
@@ -402,7 +775,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             import ogbench
             from stable_baselines3.common.vec_env import DummyVecEnv
         except ImportError:
-            print("d4rl import not successful, skipping environment interaction. Check d4rl installation.")
+            print(
+                "d4rl import not successful, skipping environment interaction. Check d4rl installation."
+            )
             return
 
         print("Interacting with environment... This may take a couple minutes.")
@@ -411,20 +786,35 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         if self.env_id in OGBENCH_ENVS:
             if "pointmaze" in self.env_id:
-                envs = DummyVecEnv([lambda: ogbench.locomaze.maze.make_maze_env('point','maze',maze_type=self.env_id.split("-")[1])] * batch_size)
+                envs = DummyVecEnv(
+                    [
+                        lambda: ogbench.locomaze.maze.make_maze_env(
+                            "point", "maze", maze_type=self.env_id.split("-")[1]
+                        )
+                    ]
+                    * batch_size
+                )
                 if self.action_dim == 2:
                     use_diffused_action = True
             elif "antmaze" in self.env_id:
-                envs = DummyVecEnv([lambda: ogbench.locomaze.maze.make_maze_env('ant','maze',maze_type=self.env_id.split("-")[1])] * batch_size)
-                #use_diffused_action = True
+                envs = DummyVecEnv(
+                    [
+                        lambda: ogbench.locomaze.maze.make_maze_env(
+                            "ant", "maze", maze_type=self.env_id.split("-")[1]
+                        )
+                    ]
+                    * batch_size
+                )
+                # use_diffused_action = True
                 from dql.main_Antmaze import hyperparameters
                 from dql.agents.ql_diffusion import Diffusion_QL as Agent
+
                 params = hyperparameters[self.dataset]
                 state_dim = envs.observation_space.shape[0]
                 action_dim = envs.action_space.shape[0]
                 max_action = float(envs.action_space.high[0])
                 agent = Agent(
-                    state_dim=state_dim*2,
+                    state_dim=state_dim * 2,
                     action_dim=action_dim,
                     max_action=max_action,
                     device=0,
@@ -450,12 +840,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     dql_folder = "antmaze-giant-navigate-v0|exp|diffusion-ql|T-5|lr_decay|ms-offline|k-1|0|2|1.0|False|cql_antmaze|0.2|4.0|10"
                 else:
                     raise ValueError(f"Dataset {self.dataset} not supported")
-                
+
                 import os
-                agent.load_model(os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200)
+
+                agent.load_model(
+                    os.path.join(os.getcwd(), "dql", "results", dql_folder), id=200
+                )
             for i, env in enumerate(envs.envs):
                 env.set_task(self.task_id + i)
-                #env.set_seed(self.interaction_seed)
+                # env.set_seed(self.interaction_seed)
         else:
             envs = DummyVecEnv([lambda: gym.make(self.env_id)] * batch_size)
             envs.seed(self.interaction_seed)
@@ -465,7 +858,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         obs_std = self.data_std[: self.observation_dim]
         obs = envs.reset()
         # Randomize the goal for each environment
-        if self.env_id in OGBENCH_ENVS: # OGBench goal setting is already done through set_task()   
+        if (
+            self.env_id in OGBENCH_ENVS
+        ):  # OGBench goal setting is already done through set_task()
             pass
         else:
             if self.use_random_goals_for_interaction:
@@ -474,10 +869,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         obs = torch.from_numpy(obs).float().to(self.device)
         start = obs.detach()
-        obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
+        obs_normalized = (
+            (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+        ).detach()
 
-        if self.env_id in OGBENCH_ENVS: # OGBench
-            goal = np.vstack([envs.reset_infos[i]['goal'] for i in range(len(envs.reset_infos))])
+        if self.env_id in OGBENCH_ENVS:  # OGBench
+            goal = np.vstack(
+                [envs.reset_infos[i]["goal"] for i in range(len(envs.reset_infos))]
+            )
         else:
             goal = np.concatenate([[env.env._target] for env in envs.envs])
         goal = torch.Tensor(goal).float().to(self.device)
@@ -492,24 +891,42 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         first_reach = np.zeros(batch_size)
 
         trajectory = []  # actual trajectory
-        all_plan_hist = []  # a list of plan histories, each history is a collection of m diffusion steps
+        all_plan_hist = (
+            []
+        )  # a list of plan histories, each history is a collection of m diffusion steps
 
         # run mpc with diffused actions
         planning_time = []
         while not terminate and steps < self.val_max_steps:
             planning_start_time = time.time()
             if self.mctd:
-                plan_hist = self.p_mctd_plan(obs_normalized, goal_normalized, self.episode_len, conditions, start.cpu().numpy()[:, :self.observation_dim], goal.cpu().numpy()[:, :self.observation_dim]) # fake plan_hist
+                plan_hist = self.p_mctd_plan(
+                    obs_normalized,
+                    goal_normalized,
+                    self.episode_len,
+                    conditions,
+                    start.cpu().numpy()[:, : self.observation_dim],
+                    goal.cpu().numpy()[:, : self.observation_dim],
+                )  # fake plan_hist
                 plan_hist = self._unnormalize_x(plan_hist)
-                plan = plan_hist[-1] # (t b c)
+                plan = plan_hist[-1]  # (t b c)
             else:
-                plan_hist = self.plan(obs_normalized, goal_normalized, self.episode_len, conditions)
+                plan_hist = self.plan(
+                    obs_normalized, goal_normalized, self.episode_len, conditions
+                )
                 plan_hist = self._unnormalize_x(plan_hist)  # (m t b c)
                 plan = plan_hist[-1]  # (t b c)
-           # Visualization
+            # Visualization
             start_numpy = start.cpu().numpy()[:, :2]
             goal_numpy = goal.cpu().numpy()[:, : self.observation_dim]
-            image = make_trajectory_images(self.env_id, plan[:, :, :2].detach().cpu().numpy(), 1, start_numpy, goal_numpy, self.plot_end_points)[0]
+            image = make_trajectory_images(
+                self.env_id,
+                plan[:, :, :2].detach().cpu().numpy(),
+                1,
+                start_numpy,
+                goal_numpy,
+                self.plot_end_points,
+            )[0]
             self.log_image(f"plan/plan_at_{steps}", Image.fromarray(image))
 
             planning_end_time = time.time()
@@ -520,14 +937,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 _plan = []
                 for t in range(plan.shape[0]):
                     for j in range(self.jump):
-                        _plan.append(plan[t, : , :2])
+                        _plan.append(plan[t, :, :2])
                 plan = torch.stack(_plan)
 
             all_plan_hist.append(plan_hist.cpu())
 
             obs_numpy = obs.detach().cpu().numpy()
             if "antmaze" in self.env_id:
-                #sub_goal = plan[self.open_loop_horizon - 1, :, :2].detach().cpu().numpy()
+                # sub_goal = plan[self.open_loop_horizon - 1, :, :2].detach().cpu().numpy()
                 sub_goal = plan[self.sub_goal_interval, :, :2].detach().cpu().numpy()
                 sub_goal_step = self.sub_goal_interval
             for t in range(self.open_loop_horizon):
@@ -536,13 +953,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 else:
                     if "antmaze" in self.env_id:
                         if np.linalg.norm(obs_numpy[0, :2] - sub_goal[0, :2]) < 1.0:
-                            print(f"sub_goal_step {sub_goal_step} achieved, next sub_goal_step {sub_goal_step + self.sub_goal_interval} in {plan.shape[0]} steps")
+                            print(
+                                f"sub_goal_step {sub_goal_step} achieved, next sub_goal_step {sub_goal_step + self.sub_goal_interval} in {plan.shape[0]} steps"
+                            )
                             sub_goal_step += self.sub_goal_interval
                             if plan.shape[0] - sub_goal_step <= 0:
                                 sub_goal = plan[-1, :, :2].detach().cpu().numpy()
                             else:
-                                sub_goal = plan[sub_goal_step, :, :2].detach().cpu().numpy()
-                        assert obs_numpy.shape[0] == 1, f"Batch size must be 1 for AntMaze, got {obs_numpy.shape[0]}"
+                                sub_goal = (
+                                    plan[sub_goal_step, :, :2].detach().cpu().numpy()
+                                )
+                        assert (
+                            obs_numpy.shape[0] == 1
+                        ), f"Batch size must be 1 for AntMaze, got {obs_numpy.shape[0]}"
                         action = agent.sample_action(obs_numpy, sub_goal)
                         action = torch.from_numpy(action).float().reshape(1, -1)
                     else:
@@ -554,9 +977,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             else:
                                 plan_vel = 0
                         if t < plan.shape[0]:
-                            action = 12.5 * (plan[t, :, :2] - obs[:, :2]) + 1.2 * (plan_vel - obs[:, 2:])
+                            action = 12.5 * (plan[t, :, :2] - obs[:, :2]) + 1.2 * (
+                                plan_vel - obs[:, 2:]
+                            )
                         else:
-                            action = 12.5 * (plan[-1, :, :2] - obs[:, :2]) + 1.2 * (plan_vel - obs[:, 2:])
+                            action = 12.5 * (plan[-1, :, :2] - obs[:, :2]) + 1.2 * (
+                                plan_vel - obs[:, 2:]
+                            )
                 action = torch.clip(action, -1, 1).detach().cpu()
                 obs_numpy, reward, done, _ = envs.step(np.nan_to_num(action.numpy()))
 
@@ -569,11 +996,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     terminate = True
                     break
 
-                obs, reward, done = [torch.from_numpy(item).float() for item in [obs_numpy, reward, done]]
+                obs, reward, done = [
+                    torch.from_numpy(item).float() for item in [obs_numpy, reward, done]
+                ]
                 bundle = self.make_bundle(obs, action, reward[..., None])
                 trajectory.append(bundle)
                 obs = obs.to(self.device)
-                obs_normalized = ((obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]).detach()
+                obs_normalized = (
+                    (obs[:, : self.observation_dim] - obs_mean[None]) / obs_std[None]
+                ).detach()
 
                 steps += 1
         self.log(f"{namespace}/planning_time", np.sum(planning_time))
@@ -583,12 +1014,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.log(f"{namespace}/success_rate", sum(episode_reward >= 1.0) / batch_size)
 
         # Visualization
-        #samples = min(16, batch_size)
+        # samples = min(16, batch_size)
         samples = min(32, batch_size)
         trajectory = torch.stack(trajectory)
         start = start[:, :2].cpu().numpy().tolist()
         goal = goal[:, :2].cpu().numpy().tolist()
-        images = make_trajectory_images(self.env_id, trajectory, samples, start, goal, self.plot_end_points)
+        images = make_trajectory_images(
+            self.env_id, trajectory, samples, start, goal, self.plot_end_points
+        )
 
         for i, img in enumerate(images):
             self.log_image(
@@ -683,17 +1116,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         return torch.cat(bundle, -1)
 
-    def _generate_noise_levels(self, xs: torch.Tensor, masks: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _generate_noise_levels(
+        self, xs: torch.Tensor, masks: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         noise_levels = super()._generate_noise_levels(xs, masks)
         _, batch_size, *_ = xs.shape
 
         # first frame is almost always known, this reflect that
         if random() < 0.5:
-            noise_levels[0] = torch.randint(0, self.timesteps // 4, (batch_size,), device=xs.device)
+            noise_levels[0] = torch.randint(
+                0, self.timesteps // 4, (batch_size,), device=xs.device
+            )
 
         return noise_levels
 
-    def visualize_node_value_plans(self, search_num, values, names, plans, value_plans, starts, goals):
+    def visualize_node_value_plans(
+        self, search_num, values, names, plans, value_plans, starts, goals
+    ):
         if plans.shape[1] != starts.shape[0]:
             starts = starts.repeat(plans.shape[1], axis=0)
         if plans.shape[1] != goals.shape[0]:
@@ -701,11 +1140,25 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plans = self._unnormalize_x(plans)
         plan_obs, _, _ = self.split_bundle(plans)
         plan_obs = plan_obs.detach().cpu().numpy()[:-1]
-        plan_images = make_trajectory_images(self.env_id, plan_obs, plan_obs.shape[1], starts, goals, self.plot_end_points)
+        plan_images = make_trajectory_images(
+            self.env_id,
+            plan_obs,
+            plan_obs.shape[1],
+            starts,
+            goals,
+            self.plot_end_points,
+        )
         value_plans = self._unnormalize_x(value_plans)
         value_plan_obs, _, _ = self.split_bundle(value_plans)
         value_plan_obs = value_plan_obs.detach().cpu().numpy()[:-1]
-        value_plan_images = make_trajectory_images(self.env_id, value_plan_obs, value_plan_obs.shape[1], starts, goals, self.plot_end_points)
+        value_plan_images = make_trajectory_images(
+            self.env_id,
+            value_plan_obs,
+            value_plan_obs.shape[1],
+            starts,
+            goals,
+            self.plot_end_points,
+        )
         for i in range(len(plan_images)):
             plan_image = plan_images[i]
             value_plan_image = value_plan_images[i]
@@ -731,20 +1184,25 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             if t == 0:
                 pos_diff = np.linalg.norm(obs[t] - starts, axis=-1)
             else:
-                pos_diff = np.linalg.norm(obs[t] - obs[t-1], axis=-1)
+                pos_diff = np.linalg.norm(obs[t] - obs[t - 1], axis=-1)
             infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
             values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
             diff_from_goal = np.linalg.norm(obs[t] - goals, axis=-1)
-            values[(diff_from_goal < 2.0) * (infos == "NotReached")] = (plans.shape[0] - t) / plans.shape[0]
+            values[(diff_from_goal < 2.0) * (infos == "NotReached")] = (
+                plans.shape[0] - t
+            ) / plans.shape[0]
             achieved_ts[(diff_from_goal < 2.0) * (infos == "NotReached")] = t
             infos[(diff_from_goal < 2.0) * (infos == "NotReached")] = "Achieved"
 
         return values, infos, achieved_ts
 
-
-    def p_mctd_plan(self, obs_normalized, goal_normalized, horizon, conditions, start, goal):
+    def p_mctd_plan(
+        self, obs_normalized, goal_normalized, horizon, conditions, start, goal
+    ):
         assert start.shape[0] == 1, "the batch size must be 1"
-        assert (not self.leaf_parallelization) or (self.parallel_search_num % len(self.mctd_guidance_scales) == 0), f"Parallel search num must be divisible by the number of guidance scales: {self.parallel_search_num} % {len(self.mctd_guidance_scales)} != 0"
+        assert (not self.leaf_parallelization) or (
+            self.parallel_search_num % len(self.mctd_guidance_scales) == 0
+        ), f"Parallel search num must be divisible by the number of guidance scales: {self.parallel_search_num} % {len(self.mctd_guidance_scales)} != 0"
 
         horizon = self.episode_len if horizon is None else horizon
         plan_tokens = np.ceil(horizon / self.frame_stack).astype(int)
@@ -753,17 +1211,41 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         max_search_num = self.mctd_max_search_num
         num_denoising_steps = self.mctd_num_denoising_steps
         skip_level_steps = self.mctd_skip_level_steps
-        terminal_depth = np.ceil((noise_level.shape[0] - 1) / num_denoising_steps).astype(int)
+        terminal_depth = np.ceil(
+            (noise_level.shape[0] - 1) / num_denoising_steps
+        ).astype(int)
         # Root Node (name, depth, parent_node, children_node_guidance_scale, plan_history)
-        root_node = TreeNode('0', 0, None, children_node_guidance_scales, [], terminal_depth=terminal_depth, virtual_visit_weight=self.virtual_visit_weight)
-        root_node.set_value(0) # Initialize the value of the root node
+        root_node = TreeNode(
+            "0",
+            0,
+            None,
+            children_node_guidance_scales,
+            [],
+            terminal_depth=terminal_depth,
+            virtual_visit_weight=self.virtual_visit_weight,
+        )
+        root_node.set_value(0)  # Initialize the value of the root node
 
         # Search
         search_num, p_search_num, solved, achieved = 0, 0, False, False
-        achieved_plans = [] # the plans that achieved the goal through the rollout
-        not_reached_plans = [] # the plans that did not achieve the goal, but there is no warp through the rollout
+        achieved_plans = []  # the plans that achieved the goal through the rollout
+        not_reached_plans = (
+            []
+        )  # the plans that did not achieve the goal, but there is no warp through the rollout
         # lists for logging time
-        selection_time, expansion_time, simulation_time, backprop_time, early_termination_time = [], [], [], [], [] # sum of the time for each batch
+        (
+            selection_time,
+            expansion_time,
+            simulation_time,
+            backprop_time,
+            early_termination_time,
+        ) = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )  # sum of the time for each batch
         simul_noiselevel_zero_padding_time = []
         simul_value_estimation_time = []
         simul_value_calculation_time = []
@@ -773,53 +1255,95 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 if time.time() - self.start_time > self.time_limit:
                     break
             else:
-                #if search_num >= max_search_num:
+                # if search_num >= max_search_num:
                 if p_search_num >= max_search_num:
                     break
 
             ## For checking the virtual visit count
-            #root_node.check_virtual_visit_count()
+            # root_node.check_virtual_visit_count()
 
             ###############################
             # Selection
             #  When leaf parallelization is True, then the selection is done in partially parallel (the children nodes from same parent node are selected at the same time)
             #  When leaf parallelization is False, then the selection is done in fully sequential (only one node is selected at a time)
-            if not self.parallel_multiple_visits: # If parallel multiple visits is False, then we need to list all the nodes to expand
+            if (
+                not self.parallel_multiple_visits
+            ):  # If parallel multiple visits is False, then we need to list all the nodes to expand
                 expandable_node_names = root_node.get_expandable_node_names()
-                #print(f"Expandable node names: {expandable_node_names}")
+                # print(f"Expandable node names: {expandable_node_names}")
             selection_start_time = time.time()
             print("============ Selection Start ============")
             psn = self.parallel_search_num
             selected_nodes, expanded_node_candidates = [], []
             while psn > 0:
                 selected_node = root_node
-                while (not selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))) and (not selected_node.is_terminal()) and (selected_node.is_selectable()):
-                    selected_node = selected_node.select(leaf_parallelization=self.leaf_parallelization)
-                if selected_node.is_terminal() or (not selected_node.is_selectable() and not selected_node.is_expandable(consider_virtually_visited=(not self.parallel_multiple_visits))):
-                    psn -= 1 if not self.leaf_parallelization else len(children_node_guidance_scales)
+                while (
+                    (
+                        not selected_node.is_expandable(
+                            consider_virtually_visited=(
+                                not self.parallel_multiple_visits
+                            )
+                        )
+                    )
+                    and (not selected_node.is_terminal())
+                    and (selected_node.is_selectable())
+                ):
+                    selected_node = selected_node.select(
+                        leaf_parallelization=self.leaf_parallelization
+                    )
+                if selected_node.is_terminal() or (
+                    not selected_node.is_selectable()
+                    and not selected_node.is_expandable(
+                        consider_virtually_visited=(not self.parallel_multiple_visits)
+                    )
+                ):
+                    psn -= (
+                        1
+                        if not self.leaf_parallelization
+                        else len(children_node_guidance_scales)
+                    )
                     continue
                 if self.leaf_parallelization:
                     for i in range(len(children_node_guidance_scales)):
                         # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
-                        expanded_node_candidate = selected_node.get_expandable_candidate(index=i, consider_virtually_visited=(not self.parallel_multiple_visits))
+                        expanded_node_candidate = (
+                            selected_node.get_expandable_candidate(
+                                index=i,
+                                consider_virtually_visited=(
+                                    not self.parallel_multiple_visits
+                                ),
+                            )
+                        )
                         selected_nodes.append(selected_node)
                         expanded_node_candidates.append(expanded_node_candidate)
                         if not self.parallel_multiple_visits:
-                            if not expanded_node_candidate['name'] in expandable_node_names:
-                                raise ValueError(f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names")
-                            expandable_node_names.remove(expanded_node_candidate['name'])
-                        #print(f"Expanded node candidate {expanded_node_candidate['name']} is selected")
+                            if (
+                                not expanded_node_candidate["name"]
+                                in expandable_node_names
+                            ):
+                                raise ValueError(
+                                    f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names"
+                                )
+                            expandable_node_names.remove(
+                                expanded_node_candidate["name"]
+                            )
+                        # print(f"Expanded node candidate {expanded_node_candidate['name']} is selected")
                         psn -= 1
                 else:
                     # when multiple visits is False, then we need to consider the virtually visited nodes to visit only once
-                    expanded_node_candidate = selected_node.get_expandable_candidate(index=None, consider_virtually_visited=(not self.parallel_multiple_visits))
+                    expanded_node_candidate = selected_node.get_expandable_candidate(
+                        index=None,
+                        consider_virtually_visited=(not self.parallel_multiple_visits),
+                    )
                     selected_nodes.append(selected_node)
                     expanded_node_candidates.append(expanded_node_candidate)
                     if not self.parallel_multiple_visits:
-                        if not expanded_node_candidate['name'] in expandable_node_names:
-                            raise ValueError(f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names")
-                        expandable_node_names.remove(expanded_node_candidate['name'])
-                    #print(f"Expanded node candidate {expanded_node_candidate['name']} is selected")
+                        if not expanded_node_candidate["name"] in expandable_node_names:
+                            raise ValueError(
+                                f"Expanded node candidate {expanded_node_candidate['name']} is not in expandable node names"
+                            )
+                        expandable_node_names.remove(expanded_node_candidate["name"])
+                    # print(f"Expanded node candidate {expanded_node_candidate['name']} is selected")
                     psn -= 1
                 if not self.parallel_multiple_visits:
                     if len(expandable_node_names) == 0:
@@ -833,8 +1357,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             selection_time.append(selection_end_time - selection_start_time)
 
             filtered_expanded_node_plan_hists = [None] * len(expanded_node_candidates)
-            filtered_value_estimation_plan_hists = [None] * len(expanded_node_candidates)
-            for _ in range(self.num_tries_for_bad_plans): # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
+            filtered_value_estimation_plan_hists = [None] * len(
+                expanded_node_candidates
+            )
+            for _ in range(
+                self.num_tries_for_bad_plans
+            ):  # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
                 ###############################
                 # Expansion
                 expansion_start_time = time.time()
@@ -846,16 +1374,36 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     if len(info["plan_history"]) == 0:
                         expanded_node_plans.append(None)
                     else:
-                        expanded_node_plans.append(info["plan_history"][-1][-1].unsqueeze(1))
-                    _noise_level = noise_level[(info["depth"] - 1) * num_denoising_steps : (info["depth"] * num_denoising_steps + 1)]
-                    #if info["depth"] == terminal_depth:
-                    _noise_level = np.concatenate([_noise_level] + [noise_level[-1:]]*(num_denoising_steps - _noise_level.shape[0]+1))
+                        expanded_node_plans.append(
+                            info["plan_history"][-1][-1].unsqueeze(1)
+                        )
+                    _noise_level = noise_level[
+                        (info["depth"] - 1)
+                        * num_denoising_steps : (
+                            info["depth"] * num_denoising_steps + 1
+                        )
+                    ]
+                    # if info["depth"] == terminal_depth:
+                    _noise_level = np.concatenate(
+                        [_noise_level]
+                        + [noise_level[-1:]]
+                        * (num_denoising_steps - _noise_level.shape[0] + 1)
+                    )
                     expanded_node_noise_levels.append(_noise_level)
                     expanded_node_guidance_scales.append(info["guidance_scale"])
-                expanded_node_guidance_scales = torch.tensor(expanded_node_guidance_scales).to(obs_normalized.device) # (batch_size,)
-                expanded_node_noise_levels = np.array(expanded_node_noise_levels, dtype=np.int32) # (batch_size, height, width)
+                expanded_node_guidance_scales = torch.tensor(
+                    expanded_node_guidance_scales
+                ).to(
+                    obs_normalized.device
+                )  # (batch_size,)
+                expanded_node_noise_levels = np.array(
+                    expanded_node_noise_levels, dtype=np.int32
+                )  # (batch_size, height, width)
                 expanded_node_plan_hists = self.parallel_plan(
-                    obs_normalized, goal_normalized, horizon, conditions,
+                    obs_normalized,
+                    goal_normalized,
+                    horizon,
+                    conditions,
                     guidance_scale=expanded_node_guidance_scales,
                     noise_level=expanded_node_noise_levels,
                     plan=expanded_node_plans,
@@ -875,44 +1423,89 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 simul_noiselevel_zero_padding_start = time.time()
                 value_estimation_plans, value_estimation_noise_levels = [], []
                 max_denoising_steps = 0
-                for i in range(len(expanded_node_candidates)): # find the max denoising steps
+                for i in range(
+                    len(expanded_node_candidates)
+                ):  # find the max denoising steps
                     _noise_level = np.concatenate(
-                        [noise_level[(expanded_node_candidates[i]["depth"] * num_denoising_steps)::skip_level_steps],
-                        noise_level[-1:]], axis=0)
+                        [
+                            noise_level[
+                                (
+                                    expanded_node_candidates[i]["depth"]
+                                    * num_denoising_steps
+                                ) :: skip_level_steps
+                            ],
+                            noise_level[-1:],
+                        ],
+                        axis=0,
+                    )
                     # update max denoising steps
                     if _noise_level.shape[0] > max_denoising_steps:
                         max_denoising_steps = _noise_level.shape[0]
                     value_estimation_noise_levels.append(_noise_level)
-                    value_estimation_plans.append(expanded_node_plan_hists[-1, :, i].unsqueeze(1))
-                for i in range(len(expanded_node_candidates)): # zero-padding
-                    length = value_estimation_noise_levels[i].shape[0]                
+                    value_estimation_plans.append(
+                        expanded_node_plan_hists[-1, :, i].unsqueeze(1)
+                    )
+                for i in range(len(expanded_node_candidates)):  # zero-padding
+                    length = value_estimation_noise_levels[i].shape[0]
                     if length < max_denoising_steps:
-                        value_estimation_noise_levels[i] = np.concatenate([
-                            value_estimation_noise_levels[i], 
-                            np.zeros((max_denoising_steps - length, value_estimation_noise_levels[i].shape[1]), dtype=np.int32)], 
-                            axis=0) # zero-padding
+                        value_estimation_noise_levels[i] = np.concatenate(
+                            [
+                                value_estimation_noise_levels[i],
+                                np.zeros(
+                                    (
+                                        max_denoising_steps - length,
+                                        value_estimation_noise_levels[i].shape[1],
+                                    ),
+                                    dtype=np.int32,
+                                ),
+                            ],
+                            axis=0,
+                        )  # zero-padding
                 simul_noiselevel_zero_padding_end = time.time()
-                simul_noiselevel_zero_padding_time.append(simul_noiselevel_zero_padding_end - simul_noiselevel_zero_padding_start)
+                simul_noiselevel_zero_padding_time.append(
+                    simul_noiselevel_zero_padding_end
+                    - simul_noiselevel_zero_padding_start
+                )
 
                 # Simulation - Value Estimation
                 simul_value_estimation_start = time.time()
-                value_estimation_noise_levels = np.array(value_estimation_noise_levels, dtype=np.int32)
+                value_estimation_noise_levels = np.array(
+                    value_estimation_noise_levels, dtype=np.int32
+                )
                 value_estimation_plan_hists = self.parallel_plan(
-                    obs_normalized, goal_normalized, horizon, conditions,
+                    obs_normalized,
+                    goal_normalized,
+                    horizon,
+                    conditions,
                     guidance_scale=expanded_node_guidance_scales,
                     noise_level=value_estimation_noise_levels,
                     plan=value_estimation_plans,
                 )
                 simul_value_estimation_end = time.time()
-                print(f"Value estimation plan hist: {value_estimation_plan_hists.shape}")
+                print(
+                    f"Value estimation plan hist: {value_estimation_plan_hists.shape}"
+                )
 
                 # check if any plan is good
-                plans = self._unnormalize_x(value_estimation_plan_hists[-1])[:-1].detach().cpu().numpy()
-                diffs = np.linalg.norm(plans[1:] - plans[:-1], axis=-1) # (plan_len-1, N)
+                plans = (
+                    self._unnormalize_x(value_estimation_plan_hists[-1])[:-1]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+                diffs = np.linalg.norm(
+                    plans[1:] - plans[:-1], axis=-1
+                )  # (plan_len-1, N)
                 for i in range(diffs.shape[1]):
-                    if filtered_expanded_node_plan_hists[i] is None and not np.all(diffs[:, i] < 0.1):
-                        filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
-                        filtered_value_estimation_plan_hists[i] = value_estimation_plan_hists[:, :, i]
+                    if filtered_expanded_node_plan_hists[i] is None and not np.all(
+                        diffs[:, i] < 0.1
+                    ):
+                        filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
+                            :, :, i
+                        ]
+                        filtered_value_estimation_plan_hists[i] = (
+                            value_estimation_plan_hists[:, :, i]
+                        )
                 if None in filtered_expanded_node_plan_hists:
                     print("No good plan found, resampling")
                     simulation_end_time = time.time()
@@ -922,22 +1515,36 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     break
             for i in range(len(filtered_expanded_node_plan_hists)):
                 if filtered_expanded_node_plan_hists[i] is None:
-                    filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[:, :, i]
-                    filtered_value_estimation_plan_hists[i] = value_estimation_plan_hists[:, :, i]
-            expanded_node_plan_hists = torch.stack(filtered_expanded_node_plan_hists, dim=2)
-            value_estimation_plan_hists = torch.stack(filtered_value_estimation_plan_hists, dim=2)
+                    filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
+                        :, :, i
+                    ]
+                    filtered_value_estimation_plan_hists[i] = (
+                        value_estimation_plan_hists[:, :, i]
+                    )
+            expanded_node_plan_hists = torch.stack(
+                filtered_expanded_node_plan_hists, dim=2
+            )
+            value_estimation_plan_hists = torch.stack(
+                filtered_value_estimation_plan_hists, dim=2
+            )
 
             # Value Calculation
             simul_value_calculation_start = time.time()
-            values, infos, achieved_ts = self.calculate_values(value_estimation_plan_hists[-1], start, goal) # (plan_len, N, D), (N, D), (N, D)
+            values, infos, achieved_ts = self.calculate_values(
+                value_estimation_plan_hists[-1], start, goal
+            )  # (plan_len, N, D), (N, D), (N, D)
             for i in range(len(infos)):
                 info = infos[i]
                 achieved_t = achieved_ts[i]
                 if info == "Achieved":
-                    achieved_plans.append([value_estimation_plan_hists[-1, :achieved_t, i], values[i]])
+                    achieved_plans.append(
+                        [value_estimation_plan_hists[-1, :achieved_t, i], values[i]]
+                    )
                     achieved = True
                 elif info == "NotReached":
-                    not_reached_plans.append([value_estimation_plan_hists[-1, :, i], values[i]])
+                    not_reached_plans.append(
+                        [value_estimation_plan_hists[-1, :, i], values[i]]
+                    )
             print(f"Value Calculation: {values}, {infos}")
             simul_value_calculation_end = time.time()
 
@@ -956,17 +1563,23 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 value_estimation_plan = value_estimation_plan_hists[-1, :, i]
                 if expanded_node_infos[name]["value"] is None:
                     expanded_node_infos[name]["value"] = value
-                    expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan
+                    expanded_node_infos[name][
+                        "value_estimation_plan"
+                    ] = value_estimation_plan
                     expanded_node_infos[name]["plan_history"][-1] = plan_hist
                 else:
                     if value > expanded_node_infos[name]["value"]:
                         expanded_node_infos[name]["value"] = value
-                        expanded_node_infos[name]["value_estimation_plan"] = value_estimation_plan
+                        expanded_node_infos[name][
+                            "value_estimation_plan"
+                        ] = value_estimation_plan
                         expanded_node_infos[name]["plan_history"][-1] = plan_hist
             for name in selected_nodes_for_expansion:
                 selected_nodes_for_expansion[name].expand(**expanded_node_infos[name])
             simul_node_allocation_end = time.time()
-            simul_node_allocation_time.append(simul_node_allocation_end - simul_node_allocation_start)
+            simul_node_allocation_time.append(
+                simul_node_allocation_end - simul_node_allocation_start
+            )
 
             print("============ Simulation End ============")
             simulation_end_time = time.time()
@@ -992,8 +1605,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             early_termination_start_time = time.time()
             print("============ Early Termination Start ============")
 
-            plans = torch.stack([info["plan_history"][-1][-1] for info in expanded_node_infos.values()], dim=1)
-            _, infos, achieved_ts = self.calculate_values(plans, start, goal) # (plan_len, N, D), (N, D), (N, D)
+            plans = torch.stack(
+                [info["plan_history"][-1][-1] for info in expanded_node_infos.values()],
+                dim=1,
+            )
+            _, infos, achieved_ts = self.calculate_values(
+                plans, start, goal
+            )  # (plan_len, N, D), (N, D), (N, D)
             print(f"Early Termination: {infos}, {achieved_ts}")
             solved = False
             for i in range(len(infos)):
@@ -1007,21 +1625,35 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             print("============ Early Termination End ============")
             early_termination_end_time = time.time()
-            early_termination_time.append(early_termination_end_time - early_termination_start_time)
+            early_termination_time.append(
+                early_termination_end_time - early_termination_start_time
+            )
 
             if self.viz_plans:
-                self.visualize_node_value_plans(search_num, values, 
+                self.visualize_node_value_plans(
+                    search_num,
+                    values,
                     [info["name"] for info in expanded_node_infos.values()],
-                    expanded_node_plan_hists[-1], value_estimation_plan_hists[-1], start, goal)
+                    expanded_node_plan_hists[-1],
+                    value_estimation_plan_hists[-1],
+                    start,
+                    goal,
+                )
 
             search_num += 1
             p_search_num += len(expanded_node_candidates)
 
-            if (self.early_stopping_condition == "solved" and solved) or (self.early_stopping_condition == "achieved" and achieved):
+            if (self.early_stopping_condition == "solved" and solved) or (
+                self.early_stopping_condition == "achieved" and achieved
+            ):
                 break
 
         if solved:
-            output_plan = torch.cat([solved_plan[:,None], goal_normalized[None]], dim=0)[None] # (1, t, 1, c)
+            output_plan = torch.cat(
+                [solved_plan[:, None], goal_normalized[None]], dim=0
+            )[
+                None
+            ]  # (1, t, 1, c)
         else:
             if len(achieved_plans) != 0:
                 max_value = -1
@@ -1031,7 +1663,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     if value > max_value:
                         max_value = value
                         max_plan = plan
-                output_plan = torch.cat([max_plan[:,None], goal_normalized[None]], dim=0)[None] # (1, t, 1, c)
+                output_plan = torch.cat(
+                    [max_plan[:, None], goal_normalized[None]], dim=0
+                )[
+                    None
+                ]  # (1, t, 1, c)
             elif len(not_reached_plans) != 0:
                 max_value = -1
                 max_plan = None
@@ -1040,10 +1676,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     if value > max_value:
                         max_value = value
                         max_plan = plan
-                output_plan = max_plan[None,:,None] # (1, t, 1, c)
+                output_plan = max_plan[None, :, None]  # (1, t, 1, c)
             else:
                 print("Failed to find the plan")
-                output_plan = torch.cat([obs_normalized[None]]*horizon, dim=0)[None] # (1, t, 1, c) failed to find the plan
+                output_plan = torch.cat([obs_normalized[None]] * horizon, dim=0)[
+                    None
+                ]  # (1, t, 1, c) failed to find the plan
 
         self.log(f"validation/search_num", search_num)
         self.log(f"validation/p_search_num", p_search_num)
@@ -1052,10 +1690,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.log(f"validation_time/expansion_time", np.sum(expansion_time))
         self.log(f"validation_time/simulation_time", np.sum(simulation_time))
         self.log(f"validation_time/backprop_time", np.sum(backprop_time))
-        self.log(f"validation_time/early_termination_time", np.sum(early_termination_time))
+        self.log(
+            f"validation_time/early_termination_time", np.sum(early_termination_time)
+        )
 
-        self.log(f"validation_time/simul_noiselevel_zero_padding_time", np.sum(simul_noiselevel_zero_padding_time))
-        self.log(f"validation_time/simul_value_estimation_time", np.sum(simul_value_estimation_time))
-        self.log(f"validation_time/simul_value_calculation_time", np.sum(simul_value_calculation_time))
-        self.log(f"validation_time/simul_node_allocation_time", np.sum(simul_node_allocation_time))
+        self.log(
+            f"validation_time/simul_noiselevel_zero_padding_time",
+            np.sum(simul_noiselevel_zero_padding_time),
+        )
+        self.log(
+            f"validation_time/simul_value_estimation_time",
+            np.sum(simul_value_estimation_time),
+        )
+        self.log(
+            f"validation_time/simul_value_calculation_time",
+            np.sum(simul_value_calculation_time),
+        )
+        self.log(
+            f"validation_time/simul_node_allocation_time",
+            np.sum(simul_node_allocation_time),
+        )
         return output_plan

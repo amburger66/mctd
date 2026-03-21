@@ -1,4 +1,9 @@
-from datasets import Maze2dOfflineRLDataset, OGMaze2dOfflineRLDataset, OGAntMazeOfflineRLDataset 
+from datasets import (
+    Maze2dOfflineRLDataset,
+    OGMaze2dOfflineRLDataset,
+    OGAntMazeOfflineRLDataset,
+    PushBoundaryOfflineRLDataset,
+)
 from algorithms.diffusion_forcing import DiffusionForcingPlanning
 from .exp_base import BaseLightningExperiment
 
@@ -26,4 +31,8 @@ class PlanningExperiment(BaseLightningExperiment):
         og_antmaze_large_navigate=OGAntMazeOfflineRLDataset,
         og_antmaze_giant_navigate=OGAntMazeOfflineRLDataset,
         og_antmaze_teleport_navigate=OGAntMazeOfflineRLDataset,
+
+        # Custom PushBoundary offline trajectories.
+        pushboundary_offline=PushBoundaryOfflineRLDataset,
+        pushboundary_2d_offline=PushBoundaryOfflineRLDataset,
     )
