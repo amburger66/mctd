@@ -1,0 +1,22 @@
+defaults:
+  - pushboundary_2d_offline
+
+# Registry key (see experiments/exp_planning.py)
+dataset: "pushboundary_circle_2d_offline"
+
+# Padded NPZ bundle (repo root-relative); keys: states, actions, valid_lengths (override with npz_*_key)
+npz_path: demos/circle_demos_full.npz
+
+# Set episode_len = T_max - 1 where states.shape[1] == T_max. Must satisfy episode_len % frame_stack == 0 (frame_stack from df_planning, default 10).
+# Update this when you know T_max from the file.
+episode_len: 990
+
+# Normalization: run scripts/compute_circle_demo_stats.py on demos/circle_demos_full.npz and replace the lists below.
+# Placeholder stats mirror pushboundary_2d_offline until you run the script on your real demos.
+observation_mean: [-0.13577485, 0.0012194117, -0.13562192, 0.0026360064]
+observation_std:  [0.09517646, 0.13035362, 0.079566696, 0.11983518]
+action_mean:      [-0.13578489, 0.0012268482]
+action_std:       [0.09516594, 0.13028038]
+
+# Optional metadata for documentation (not read by Dataset)
+block_geom: circle

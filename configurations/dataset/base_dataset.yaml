@@ -2,3 +2,6 @@
 
 debug: ${debug} # inherited from configurations/config.yaml
 jump: ${jump} # inherited from configurations/config.yaml
+
+# 2D PushBoundary visualization (df_planning): square | circle
+block_geom: square

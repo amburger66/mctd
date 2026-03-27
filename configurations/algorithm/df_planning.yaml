@@ -14,6 +14,7 @@ gamma: ${dataset.gamma}
 episode_len: ${dataset.episode_len}
 env_id: ${dataset.env_id}
 dataset: ${dataset.dataset}
+block_geom: ${dataset.block_geom}
 # non dataset info
 x_shape: null
 frame_stack: 10

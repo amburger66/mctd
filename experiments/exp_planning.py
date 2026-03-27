@@ -35,4 +35,5 @@ class PlanningExperiment(BaseLightningExperiment):
         # Custom PushBoundary offline trajectories.
         pushboundary_offline=PushBoundaryOfflineRLDataset,
         pushboundary_2d_offline=PushBoundaryOfflineRLDataset,
+        pushboundary_circle_2d_offline=PushBoundaryOfflineRLDataset,
     )

@@ -74,6 +74,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.num_tries_for_bad_plans = cfg.num_tries_for_bad_plans
         self.sub_goal_interval = cfg.sub_goal_interval
         self.viz_plans = cfg.viz_plans
+        self.block_geom = str(getattr(cfg, "block_geom", "square"))
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
 
@@ -211,10 +212,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         start_marker: Optional[np.ndarray] = None,
         goal_marker: Optional[np.ndarray] = None,
         output_format: str = "gif",
+        block_geom: str = "square",
     ) -> None:
         """
         Render a 2D PushBoundary trajectory [tcp_x, tcp_y, block_x, block_y] as a GIF or MP4.
-        Draws robot TCP (circle) and block (rectangle) geometry at each frame.
+        Draws robot TCP (circle) and block (rectangle or circle per block_geom) at each frame.
         Block uses initial pose (identity rotation) translated to predicted x,y.
         All trajectory frames are included. FPS is computed adaptively so that:
         - Short trajectories (few frames) play over at least min_duration_sec for visibility.
@@ -237,15 +239,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         from matplotlib.lines import Line2D
         from matplotlib.patches import Circle, Rectangle
 
-        # Geometry from vis_lowdim (Push-v1 cube block)
+        # Cube block half-extent (Push-v1); circle radius — keep in sync with envs/push_boundary.py CIRCLE_RADIUS
         BLOCK_HALF = 0.025
+        CIRCLE_BLOCK_RADIUS = 0.025
         STICK_RADIUS = 0.008
+        block_geom = block_geom.lower()
 
         pad = 0.02
-        x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
-        x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
-        y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
-        y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
+        block_pad = CIRCLE_BLOCK_RADIUS if block_geom == "circle" else BLOCK_HALF
+        x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min() - block_pad) - pad
+        x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max() + block_pad) + pad
+        y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min() - block_pad) - pad
+        y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max() + block_pad) + pad
         if start_marker is not None:
             x_min = min(x_min, start_marker[0] - pad)
             x_max = max(x_max, start_marker[0] + pad)
@@ -291,17 +296,29 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     zorder=3,
                 )
             )
-            ax.add_patch(
-                Rectangle(
-                    (block_now[0] - BLOCK_HALF, block_now[1] - BLOCK_HALF),
-                    width=2 * BLOCK_HALF,
-                    height=2 * BLOCK_HALF,
-                    facecolor="#0066ff",
-                    edgecolor="#0047ab",
-                    linewidth=1,
-                    zorder=3,
+            if block_geom == "circle":
+                ax.add_patch(
+                    Circle(
+                        (block_now[0], block_now[1]),
+                        radius=CIRCLE_BLOCK_RADIUS,
+                        facecolor="#0066ff",
+                        edgecolor="#0047ab",
+                        linewidth=1,
+                        zorder=3,
+                    )
                 )
-            )
+            else:
+                ax.add_patch(
+                    Rectangle(
+                        (block_now[0] - BLOCK_HALF, block_now[1] - BLOCK_HALF),
+                        width=2 * BLOCK_HALF,
+                        height=2 * BLOCK_HALF,
+                        facecolor="#0066ff",
+                        edgecolor="#0047ab",
+                        linewidth=1,
+                        zorder=3,
+                    )
+                )
             if start_marker is not None:
                 ax.plot(
                     start_marker[0],
@@ -338,7 +355,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 Line2D(
                     [0],
                     [0],
-                    marker="s",
+                    marker="o" if block_geom == "circle" else "s",
                     color="w",
                     markerfacecolor="#0066ff",
                     markersize=8,
@@ -560,6 +577,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         namespace="training",
                         states=states,
                         sample_idx=sample_idx,
+                        block_geom=self.block_geom,
                     )
 
         output_dict = {

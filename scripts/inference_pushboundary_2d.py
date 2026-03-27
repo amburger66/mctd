@@ -73,8 +73,14 @@ def parse_args():
     parser.add_argument(
         "--format",
         choices=["gif", "mp4"],
-        default="gif",
+        default="mp4",
         help="Output format for trajectory visualizations (default: gif)",
+    )
+    parser.add_argument(
+        "--block-geom",
+        choices=["square", "circle"],
+        default="square",
+        help="Block shape in 2D viz (circle matches envs/push_boundary.py circle block)",
     )
     return parser.parse_args()
 
@@ -137,7 +143,13 @@ def load_checkpoint(algo, ckpt_path: Path, device: torch.device):
 
 
 def run_unguided(
-    algo, dataset, num_samples: int, output_dir: Path, device: torch.device, output_format: str = "gif"
+    algo,
+    dataset,
+    num_samples: int,
+    output_dir: Path,
+    device: torch.device,
+    output_format: str = "mp4",
+    block_geom: str = "square",
 ):
     from torch.utils.data import DataLoader
 
@@ -212,13 +224,16 @@ def run_unguided(
             states = obs_np[:, b, :].astype(np.float32)
             trajectories.append(states)
             np.save(mode_dir / f"trajectory_{sample_idx}.npy", states)
-            viz_dir = mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
+            viz_dir = (
+                mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
+            )
             algo._log_or_save_pushboundary_2d_gif(
                 namespace="unguided",
                 states=states,
                 sample_idx=sample_idx,
                 gif_out_dir=viz_dir,
                 output_format=output_format,
+                block_geom=block_geom,
             )
             sample_idx += 1
 
@@ -247,7 +262,15 @@ def _get_start_goal_from_dataset(dataset, num_samples, algo, device):
     return start_norm, goal_norm
 
 
-def run_guided(algo, dataset, args, output_dir: Path, device: torch.device, output_format: str = "gif"):
+def run_guided(
+    algo,
+    dataset,
+    args,
+    output_dir: Path,
+    device: torch.device,
+    output_format: str = "mp4",
+    block_geom: str = "square",
+):
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
@@ -303,10 +326,9 @@ def run_guided(algo, dataset, args, output_dir: Path, device: torch.device, outp
         states = full_traj.detach().cpu().numpy().astype(np.float32)
         trajectories.append(states)
         np.save(mode_dir / f"trajectory_{i}.npy", states)
-        goal_unnorm = (
-            goal_norm[i] * torch.from_numpy(obs_std).to(device)
-            + torch.from_numpy(obs_mean).to(device)
-        )
+        goal_unnorm = goal_norm[i] * torch.from_numpy(obs_std).to(
+            device
+        ) + torch.from_numpy(obs_mean).to(device)
         start_marker = start_unnorm[0, 2:4].detach().cpu().numpy().astype(np.float32)
         goal_marker = goal_unnorm[2:4].detach().cpu().numpy().astype(np.float32)
         states_2d = states.squeeze(1)
@@ -318,11 +340,20 @@ def run_guided(algo, dataset, args, output_dir: Path, device: torch.device, outp
             start_marker=start_marker,
             goal_marker=goal_marker,
             output_format=output_format,
+            block_geom=block_geom,
         )
     return trajectories
 
 
-def run_guided_inpaint(algo, dataset, args, output_dir: Path, device: torch.device, output_format: str = "gif"):
+def run_guided_inpaint(
+    algo,
+    dataset,
+    args,
+    output_dir: Path,
+    device: torch.device,
+    output_format: str = "mp4",
+    block_geom: str = "square",
+):
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
@@ -373,10 +404,9 @@ def run_guided_inpaint(algo, dataset, args, output_dir: Path, device: torch.devi
         states = full_traj.detach().cpu().numpy().astype(np.float32)
         trajectories.append(states)
         np.save(mode_dir / f"trajectory_{i}.npy", states)
-        goal_unnorm = (
-            goal_norm[i] * torch.from_numpy(obs_std).to(device)
-            + torch.from_numpy(obs_mean).to(device)
-        )
+        goal_unnorm = goal_norm[i] * torch.from_numpy(obs_std).to(
+            device
+        ) + torch.from_numpy(obs_mean).to(device)
         start_marker = start_unnorm[0, 2:4].detach().cpu().numpy().astype(np.float32)
         goal_marker = goal_unnorm[2:4].detach().cpu().numpy().astype(np.float32)
         states_2d = states.squeeze(1)
@@ -388,6 +418,7 @@ def run_guided_inpaint(algo, dataset, args, output_dir: Path, device: torch.devi
             start_marker=start_marker,
             goal_marker=goal_marker,
             output_format=output_format,
+            block_geom=block_geom,
         )
     return trajectories
 
@@ -408,11 +439,35 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "unguided":
-        run_unguided(algo, dataset, args.num_samples, output_dir, device, args.format)
+        run_unguided(
+            algo,
+            dataset,
+            args.num_samples,
+            output_dir,
+            device,
+            args.format,
+            block_geom=args.block_geom,
+        )
     elif args.mode == "guided":
-        run_guided(algo, dataset, args, output_dir, device, args.format)
+        run_guided(
+            algo,
+            dataset,
+            args,
+            output_dir,
+            device,
+            args.format,
+            block_geom=args.block_geom,
+        )
     elif args.mode == "guided_inpaint":
-        run_guided_inpaint(algo, dataset, args, output_dir, device, args.format)
+        run_guided_inpaint(
+            algo,
+            dataset,
+            args,
+            output_dir,
+            device,
+            args.format,
+            block_geom=args.block_geom,
+        )
 
     print(f"Outputs saved to {output_dir}")
 
