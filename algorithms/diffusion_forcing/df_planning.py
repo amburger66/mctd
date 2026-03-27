@@ -200,12 +200,30 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         states: np.ndarray,
         sample_idx: int,
         *,
-        num_frames: int = 8,
+        num_frames: Optional[int] = None,
         dpi: int = 100,
-        fps: float = 15.0,
+        fps: Optional[float] = None,
+        min_fps: float = 10.0,
+        max_fps: float = 60.0,
+        min_duration_sec: float = 4.0,
+        max_gif_duration_sec: float = 20.0,
+        gif_out_dir: Optional[Path] = None,
+        start_marker: Optional[np.ndarray] = None,
+        goal_marker: Optional[np.ndarray] = None,
+        output_format: str = "gif",
     ) -> None:
         """
-        Render a 2D PushBoundary trajectory [tcp_x, tcp_y, block_x, block_y] as a GIF.
+        Render a 2D PushBoundary trajectory [tcp_x, tcp_y, block_x, block_y] as a GIF or MP4.
+        Draws robot TCP (circle) and block (rectangle) geometry at each frame.
+        Block uses initial pose (identity rotation) translated to predicted x,y.
+        All trajectory frames are included. FPS is computed adaptively so that:
+        - Short trajectories (few frames) play over at least min_duration_sec for visibility.
+        - Long trajectories stay under max_gif_duration_sec.
+        - FPS is clamped to [min_fps, max_fps] for smooth playback.
+        When num_frames is provided and less than T, subsample to that many frames.
+        When start_marker/goal_marker (each shape (2,) for x,y) are provided, draw red + and green +.
+        When gif_out_dir is provided, save there instead of using trainer paths.
+        output_format: "gif" or "mp4".
         """
         if states.ndim != 2 or states.shape[-1] < 4:
             return
@@ -213,49 +231,143 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         block_xy = states[:, 2:4]
 
         import matplotlib
+
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Circle, Rectangle
+
+        # Geometry from vis_lowdim (Push-v1 cube block)
+        BLOCK_HALF = 0.025
+        STICK_RADIUS = 0.008
 
         pad = 0.02
         x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
         x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
         y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
         y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
+        if start_marker is not None:
+            x_min = min(x_min, start_marker[0] - pad)
+            x_max = max(x_max, start_marker[0] + pad)
+            y_min = min(y_min, start_marker[1] - pad)
+            y_max = max(y_max, start_marker[1] + pad)
+        if goal_marker is not None:
+            x_min = min(x_min, goal_marker[0] - pad)
+            x_max = max(x_max, goal_marker[0] + pad)
+            y_min = min(y_min, goal_marker[1] - pad)
+            y_max = max(y_max, goal_marker[1] + pad)
 
         T = states.shape[0]
-        k = min(num_frames, T)
-        step_indices = (
-            [0]
-            if k <= 1
-            else np.linspace(0, T - 1, num=k, dtype=int).tolist()
-        )
+        n_include = T  # Always visualize all trajectory frames (no truncation).
+
+        # Adaptive FPS: target duration between min_duration_sec and max_gif_duration_sec
+        # so short trajs are visible, long trajs stay under max duration.
+        if fps is None:
+            target_duration = np.clip(
+                T / 24.0, min_duration_sec, max_gif_duration_sec
+            )
+            fps = float(np.clip(T / target_duration, min_fps, max_fps))
+
+        if num_frames is None or num_frames >= n_include:
+            step_indices = list(range(n_include))
+        else:
+            step_indices = np.linspace(
+                0, n_include - 1, num=num_frames, dtype=int
+            ).tolist()
 
         frames_img = []
         for s in step_indices:
             end = int(s) + 1
             fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
-            ax.plot(
-                tcp_xy[:end, 0],
-                tcp_xy[:end, 1],
-                "o-",
-                color="#e63946",
-                markersize=2,
-                linewidth=1,
-                label="tcp",
+            tcp_now = tcp_xy[end - 1]
+            block_now = block_xy[end - 1]
+            ax.add_patch(
+                Circle(
+                    (tcp_now[0], tcp_now[1]),
+                    radius=STICK_RADIUS,
+                    facecolor="#e63946",
+                    edgecolor="#c1121f",
+                    linewidth=1,
+                    zorder=3,
+                )
             )
-            ax.plot(
-                block_xy[:end, 0],
-                block_xy[:end, 1],
-                "o-",
-                color="#0066ff",
-                markersize=2,
-                linewidth=1,
-                label="block",
+            ax.add_patch(
+                Rectangle(
+                    (block_now[0] - BLOCK_HALF, block_now[1] - BLOCK_HALF),
+                    width=2 * BLOCK_HALF,
+                    height=2 * BLOCK_HALF,
+                    facecolor="#0066ff",
+                    edgecolor="#0047ab",
+                    linewidth=1,
+                    zorder=3,
+                )
             )
+            if start_marker is not None:
+                ax.plot(
+                    start_marker[0],
+                    start_marker[1],
+                    marker="+",
+                    color="#e63946",
+                    markersize=14,
+                    markeredgewidth=2,
+                    zorder=4,
+                )
+            if goal_marker is not None:
+                ax.plot(
+                    goal_marker[0],
+                    goal_marker[1],
+                    marker="+",
+                    color="#2d6a4f",
+                    markersize=14,
+                    markeredgewidth=2,
+                    zorder=4,
+                )
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
             ax.set_aspect("equal")
-            ax.legend(loc="upper right", fontsize=7)
+            legend_elements = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="#e63946",
+                    markersize=8,
+                    label="tcp",
+                ),
+                Line2D(
+                    [0],
+                    [0],
+                    marker="s",
+                    color="w",
+                    markerfacecolor="#0066ff",
+                    markersize=8,
+                    label="block",
+                ),
+            ]
+            if start_marker is not None:
+                legend_elements.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="+",
+                        color="#e63946",
+                        markersize=10,
+                        label="start",
+                    )
+                )
+            if goal_marker is not None:
+                legend_elements.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="+",
+                        color="#2d6a4f",
+                        markersize=10,
+                        label="goal",
+                    )
+                )
+            ax.legend(handles=legend_elements, loc="upper right", fontsize=7)
             ax.set_title(f"step {s}", fontsize=8)
             ax.set_xlabel("X", fontsize=7)
             ax.set_ylabel("Y", fontsize=7)
@@ -267,24 +379,41 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             frames_img.append(img)
             plt.close(fig)
 
-        root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
-        out_dir = (
-            root_dir
-            / "visualizations"
-            / "pushboundary_2d"
-            / namespace
-            / f"global_step_{self.global_step:07d}"
-        )
+        if gif_out_dir is not None:
+            out_dir = Path(gif_out_dir)
+        else:
+            root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
+            out_dir = (
+                root_dir
+                / "visualizations"
+                / "pushboundary_2d"
+                / namespace
+                / f"global_step_{getattr(self, 'global_step', 0):07d}"
+            )
         out_dir.mkdir(parents=True, exist_ok=True)
-        gif_path = out_dir / f"sample_{sample_idx}.gif"
+        ext = "mp4" if output_format == "mp4" else "gif"
+        out_path = out_dir / f"sample_{sample_idx}.{ext}"
 
-        repo_root = Path(__file__).resolve().parents[4]
-        scripts_dir = repo_root / "scripts"
-        import sys
-        if str(scripts_dir) not in sys.path:
-            sys.path.insert(0, str(scripts_dir))
-        import vis_lowdim as vl
-        vl.save_gif(frames_img, str(gif_path), fps=fps)
+        if output_format == "mp4":
+            import cv2
+
+            h, w = frames_img[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+            for img in frames_img:
+                bgr = cv2.cvtColor(img[:, :, 1:4], cv2.COLOR_RGB2BGR)
+                writer.write(bgr)
+            writer.release()
+        else:
+            duration_ms = int(1000.0 / fps)
+            pil_frames = [Image.fromarray(f) for f in frames_img]
+            pil_frames[0].save(
+                str(out_path),
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=duration_ms,
+                loop=0,
+            )
 
         if self.logger is not None:
             try:
@@ -467,6 +596,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # returns plan history of (m, t, b, c), where the last dim of m is the fully diffused plan
 
         batch_size = start.shape[0]
+        start = start.float()
+        goal = goal.float()
 
         start = self.make_bundle(start)
         goal = self.make_bundle(goal)
@@ -566,7 +697,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             (pad_tokens, batch_size, *self.x_stacked_shape), device=self.device
         )
         init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
-        plan = torch.cat([init_token, chunk, pad], 0)
+        plan = torch.cat([init_token, chunk, pad], 0).float()
 
         plan_hist = [plan.detach().clone()[: self.n_tokens - pad_tokens]]
         stabilization = 0
@@ -589,13 +720,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             to_noise_levels = torch.from_numpy(to_noise_levels).to(self.device)
             from_noise_levels = repeat(from_noise_levels, "t -> t b", b=batch_size)
             to_noise_levels = repeat(to_noise_levels, "t -> t b", b=batch_size)
-            plan[1 : self.n_tokens - pad_tokens] = self.diffusion_model.sample_step(
+            step_result = self.diffusion_model.sample_step(
                 plan,
                 conditions,
                 from_noise_levels,
                 to_noise_levels,
                 guidance_fn=guidance_fn,
             )[1 : self.n_tokens - pad_tokens]
+            plan[1 : self.n_tokens - pad_tokens] = step_result.float()
             plan_hist.append(plan.detach().clone()[: self.n_tokens - pad_tokens])
 
         plan_hist = torch.stack(plan_hist)
@@ -604,6 +736,90 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         )
         plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
 
+        return plan_hist
+
+    def plan_inpaint(
+        self,
+        start: torch.Tensor,
+        goal: torch.Tensor,
+        horizon: int,
+        conditions: Optional[Any] = None,
+    ):
+        """
+        Goal-conditioned planning with last-frame inpainting: at each denoising step,
+        replace the last frame's observation with the goal.
+        start and goal are normalized tensors of shape (b, obs_dim).
+        Returns plan_hist of shape (1, horizon, batch, bundle_dim).
+        """
+        batch_size = start.shape[0]
+        start = start.float()
+        goal = goal.float()
+        start = self.make_bundle(start)
+        goal_bundle = self.make_bundle(goal)
+
+        plan_tokens = int(np.ceil(horizon / self.frame_stack))
+        pad_tokens = 0 if self.causal else self.n_tokens - plan_tokens - 1
+        scheduling_matrix = self._generate_scheduling_matrix(plan_tokens)
+
+        chunk = torch.randn(
+            (plan_tokens, batch_size, *self.x_stacked_shape), device=self.device
+        )
+        chunk = torch.clamp(
+            chunk, -self.cfg.diffusion.clip_noise, self.cfg.diffusion.clip_noise
+        )
+        pad = torch.zeros(
+            (pad_tokens, batch_size, *self.x_stacked_shape), device=self.device
+        )
+        init_token = rearrange(self.pad_init(start), "fs b c -> 1 b (fs c)")
+        plan = torch.cat([init_token, chunk, pad], 0).float()
+
+        stabilization = 0
+        for m in range(scheduling_matrix.shape[0] - 1):
+            from_noise_levels = np.concatenate(
+                [
+                    np.array((stabilization,), dtype=np.int64),
+                    scheduling_matrix[m],
+                    np.array([self.sampling_timesteps] * pad_tokens, dtype=np.int64),
+                ]
+            )
+            to_noise_levels = np.concatenate(
+                [
+                    np.array((stabilization,), dtype=np.int64),
+                    scheduling_matrix[m + 1],
+                    np.array([self.sampling_timesteps] * pad_tokens, dtype=np.int64),
+                ]
+            )
+            from_noise_levels = torch.from_numpy(from_noise_levels).to(self.device)
+            to_noise_levels = torch.from_numpy(to_noise_levels).to(self.device)
+            from_noise_levels = repeat(from_noise_levels, "t -> t b", b=batch_size)
+            to_noise_levels = repeat(to_noise_levels, "t -> t b", b=batch_size)
+            step_result = self.diffusion_model.sample_step(
+                plan, conditions, from_noise_levels, to_noise_levels
+            )[1 : self.n_tokens - pad_tokens]
+            plan[1 : self.n_tokens - pad_tokens] = step_result.float()
+
+            plan_rearr = rearrange(
+                plan[: self.n_tokens - pad_tokens],
+                "t b (fs c) -> (t fs) b c",
+                fs=self.frame_stack,
+            )
+            plan_rearr = plan_rearr[self.frame_stack : self.frame_stack + horizon]
+            obs, action, _ = self.split_bundle(plan_rearr)
+            obs[-1] = goal_bundle[:, : self.observation_dim].to(obs.device)
+            action[-1].zero_()
+            plan_rearr = self.make_bundle(obs, action)
+            plan_rearr_full = rearrange(
+                plan_rearr,
+                "(t fs) b c -> t b (fs c)",
+                fs=self.frame_stack,
+            )
+            plan[1 : 1 + plan_rearr_full.shape[0]] = plan_rearr_full
+
+        plan_hist = plan.detach().clone()[: self.n_tokens - pad_tokens]
+        plan_hist = rearrange(
+            plan_hist, "t b (fs c) -> 1 (t fs) b c", fs=self.frame_stack
+        )
+        plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
         return plan_hist
 
     def parallel_plan(
