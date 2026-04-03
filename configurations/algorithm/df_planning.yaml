@@ -50,6 +50,8 @@ early_stopping_condition: "solved"
 num_tries_for_bad_plans: 10
 sub_goal_interval: 10
 viz_plans: False
+# 2D PushBoundary GIF: block geometry in BEV ("square" or "circle").
+viz_block_shape: square
 
 diffusion:
   stabilization_level: 10

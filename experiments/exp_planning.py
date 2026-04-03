@@ -3,6 +3,7 @@ from datasets import (
     OGMaze2dOfflineRLDataset,
     OGAntMazeOfflineRLDataset,
     PushBoundaryOfflineRLDataset,
+    CirclePaddedOfflineRLDataset,
 )
 from algorithms.diffusion_forcing import DiffusionForcingPlanning
 from .exp_base import BaseLightningExperiment
@@ -35,4 +36,5 @@ class PlanningExperiment(BaseLightningExperiment):
         # Custom PushBoundary offline trajectories.
         pushboundary_offline=PushBoundaryOfflineRLDataset,
         pushboundary_2d_offline=PushBoundaryOfflineRLDataset,
+        circle_2d_offline=CirclePaddedOfflineRLDataset,
     )

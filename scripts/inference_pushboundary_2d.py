@@ -9,11 +9,13 @@ Usage (run from submodules/mctd/):
     python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --num_samples 4
     python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --start -0.2,0.0,-0.2,0.0 --goal 0.1,0.1,0.05,0.05
     python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --format mp4
+    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --guidance_scales 0.1,0.5,1,2
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -42,7 +44,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("inference/pushboundary_2d"),
+        default=Path("inference_results/pushboundary_2d"),
         help="Output directory for visualizations (GIF/MP4) and trajectories",
     )
     parser.add_argument(
@@ -61,7 +63,20 @@ def parse_args():
         "--guidance_scale",
         type=float,
         default=None,
-        help="Guidance scale for guided mode (default: from config)",
+        help=(
+            "Guidance scale for guided mode when not using --guidance_scales (default: from config). "
+            "Ignored when --guidance_scales is set."
+        ),
+    )
+    parser.add_argument(
+        "--guidance_scales",
+        type=str,
+        default=None,
+        help=(
+            "Guided mode only: comma-separated guidance scales (e.g. 0.1,0.5,1,2). "
+            "Each run writes to output_dir/guided/scale_<tag>/. "
+            "Omit for a single run under output_dir/guided/ using --guidance_scale or checkpoint default."
+        ),
     )
     parser.add_argument(
         "--horizon",
@@ -76,7 +91,43 @@ def parse_args():
         default="gif",
         help="Output format for trajectory visualizations (default: gif)",
     )
+    parser.add_argument(
+        "--no_reset_seed_between_guidance_scales",
+        action="store_true",
+        help=(
+            "Guided guidance sweep only: do not reset torch/numpy RNG before each guidance scale "
+            "(default resets so start/goal and noise match across scales)."
+        ),
+    )
+    parser.add_argument(
+        "--block_shape",
+        choices=["square", "circle"],
+        default="square",
+        help="BEV block geometry in GIF/MP4 (circle matches envs/push_boundary.py CIRCLE_RADIUS)",
+    )
     return parser.parse_args()
+
+
+def _parse_guidance_scales(s: str | None) -> list[float] | None:
+    if s is None or not str(s).strip():
+        return None
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return None
+    out: list[float] = []
+    seen: set[float] = set()
+    for p in parts:
+        v = float(p)
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _guidance_scale_dirname(g: float) -> str:
+    """Filesystem-safe tag for a guidance scale (used in scale_<tag> directories)."""
+    s = f"{g:.6g}"
+    return s.replace(".", "p").replace("-", "m")
 
 
 def load_config():
@@ -119,9 +170,13 @@ def build_algo_and_dataset():
     from experiments import build_experiment
 
     cfg = load_config()
+    print(cfg)
     experiment = build_experiment(cfg, logger=None, ckpt_path=None)
     algo = experiment._build_algo()
     dataset = experiment._build_dataset("validation")
+    import pdb
+
+    pdb.set_trace()
     return algo, dataset, cfg
 
 
@@ -137,14 +192,26 @@ def load_checkpoint(algo, ckpt_path: Path, device: torch.device):
 
 
 def run_unguided(
-    algo, dataset, num_samples: int, output_dir: Path, device: torch.device, output_format: str = "gif"
+    algo,
+    dataset,
+    num_samples: int,
+    output_dir: Path,
+    device: torch.device,
+    output_format: str = "gif",
+    mode_dir: Path | None = None,
+    block_shape: str = "square",
 ):
+    """
+    Unguided conditional completion.
+    If ``mode_dir`` is None, writes under ``output_dir / "unguided"``.
+    """
     from torch.utils.data import DataLoader
 
     dataloader = DataLoader(
         dataset, batch_size=min(num_samples, 4), shuffle=True, num_workers=0
     )
-    mode_dir = output_dir / "unguided"
+    if mode_dir is None:
+        mode_dir = output_dir / "unguided"
     mode_dir.mkdir(parents=True, exist_ok=True)
 
     algo.eval()
@@ -163,11 +230,7 @@ def run_unguided(
         curr_frame = n_context_frames
 
         while curr_frame < n_frames:
-            horizon = (
-                min(n_frames - curr_frame, algo.chunk_size)
-                if algo.chunk_size > 0
-                else n_frames - curr_frame
-            )
+            horizon = min(n_frames - curr_frame, algo.chunk_size)
             scheduling_matrix = algo._generate_scheduling_matrix(horizon)
 
             chunk = torch.randn(
@@ -212,13 +275,16 @@ def run_unguided(
             states = obs_np[:, b, :].astype(np.float32)
             trajectories.append(states)
             np.save(mode_dir / f"trajectory_{sample_idx}.npy", states)
-            viz_dir = mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
+            viz_dir = (
+                mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
+            )
             algo._log_or_save_pushboundary_2d_gif(
                 namespace="unguided",
                 states=states,
                 sample_idx=sample_idx,
                 gif_out_dir=viz_dir,
                 output_format=output_format,
+                block_shape=block_shape,
             )
             sample_idx += 1
 
@@ -247,7 +313,21 @@ def _get_start_goal_from_dataset(dataset, num_samples, algo, device):
     return start_norm, goal_norm
 
 
-def run_guided(algo, dataset, args, output_dir: Path, device: torch.device, output_format: str = "gif"):
+def run_guided(
+    algo,
+    dataset,
+    args,
+    output_dir: Path,
+    device: torch.device,
+    output_format: str = "gif",
+    *,
+    guidance_scale: float | None = None,
+    mode_dir: Path | None = None,
+):
+    """
+    Goal-conditioned planning. If ``mode_dir`` is None, writes under ``output_dir / "guided"``.
+    If ``guidance_scale`` is None, uses ``args.guidance_scale`` or the checkpoint default.
+    """
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
@@ -270,11 +350,15 @@ def run_guided(algo, dataset, args, output_dir: Path, device: torch.device, outp
         )
 
     horizon = args.horizon if args.horizon is not None else algo.episode_len
-    guidance_scale = (
-        args.guidance_scale if args.guidance_scale is not None else algo.guidance_scale
-    )
+    if guidance_scale is None:
+        guidance_scale = (
+            args.guidance_scale
+            if args.guidance_scale is not None
+            else algo.guidance_scale
+        )
 
-    mode_dir = output_dir / "guided"
+    if mode_dir is None:
+        mode_dir = output_dir / "guided"
     mode_dir.mkdir(parents=True, exist_ok=True)
     viz_dir = mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
 
@@ -303,10 +387,9 @@ def run_guided(algo, dataset, args, output_dir: Path, device: torch.device, outp
         states = full_traj.detach().cpu().numpy().astype(np.float32)
         trajectories.append(states)
         np.save(mode_dir / f"trajectory_{i}.npy", states)
-        goal_unnorm = (
-            goal_norm[i] * torch.from_numpy(obs_std).to(device)
-            + torch.from_numpy(obs_mean).to(device)
-        )
+        goal_unnorm = goal_norm[i] * torch.from_numpy(obs_std).to(
+            device
+        ) + torch.from_numpy(obs_mean).to(device)
         start_marker = start_unnorm[0, 2:4].detach().cpu().numpy().astype(np.float32)
         goal_marker = goal_unnorm[2:4].detach().cpu().numpy().astype(np.float32)
         states_2d = states.squeeze(1)
@@ -318,11 +401,19 @@ def run_guided(algo, dataset, args, output_dir: Path, device: torch.device, outp
             start_marker=start_marker,
             goal_marker=goal_marker,
             output_format=output_format,
+            block_shape=args.block_shape,
         )
     return trajectories
 
 
-def run_guided_inpaint(algo, dataset, args, output_dir: Path, device: torch.device, output_format: str = "gif"):
+def run_guided_inpaint(
+    algo,
+    dataset,
+    args,
+    output_dir: Path,
+    device: torch.device,
+    output_format: str = "gif",
+):
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
@@ -373,10 +464,9 @@ def run_guided_inpaint(algo, dataset, args, output_dir: Path, device: torch.devi
         states = full_traj.detach().cpu().numpy().astype(np.float32)
         trajectories.append(states)
         np.save(mode_dir / f"trajectory_{i}.npy", states)
-        goal_unnorm = (
-            goal_norm[i] * torch.from_numpy(obs_std).to(device)
-            + torch.from_numpy(obs_mean).to(device)
-        )
+        goal_unnorm = goal_norm[i] * torch.from_numpy(obs_std).to(
+            device
+        ) + torch.from_numpy(obs_mean).to(device)
         start_marker = start_unnorm[0, 2:4].detach().cpu().numpy().astype(np.float32)
         goal_marker = goal_unnorm[2:4].detach().cpu().numpy().astype(np.float32)
         states_2d = states.squeeze(1)
@@ -388,12 +478,20 @@ def run_guided_inpaint(algo, dataset, args, output_dir: Path, device: torch.devi
             start_marker=start_marker,
             goal_marker=goal_marker,
             output_format=output_format,
+            block_shape=args.block_shape,
         )
     return trajectories
 
 
 def main():
     args = parse_args()
+    if (
+        args.guidance_scales is not None
+        and str(args.guidance_scales).strip()
+        and args.mode != "guided"
+    ):
+        sys.stderr.write("--guidance_scales is only supported with --mode guided.\n")
+        sys.exit(2)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -408,9 +506,60 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.mode == "unguided":
-        run_unguided(algo, dataset, args.num_samples, output_dir, device, args.format)
+        run_unguided(
+            algo,
+            dataset,
+            args.num_samples,
+            output_dir,
+            device,
+            args.format,
+            block_shape=args.block_shape,
+        )
     elif args.mode == "guided":
-        run_guided(algo, dataset, args, output_dir, device, args.format)
+        scale_list = _parse_guidance_scales(args.guidance_scales)
+        if scale_list is None:
+            run_guided(algo, dataset, args, output_dir, device, args.format)
+        else:
+            guided_root = output_dir / "guided"
+            guided_root.mkdir(parents=True, exist_ok=True)
+            sweep_runs: list[dict] = []
+            for g in scale_list:
+                if not args.no_reset_seed_between_guidance_scales:
+                    torch.manual_seed(args.seed)
+                    np.random.seed(args.seed)
+                tag = _guidance_scale_dirname(g)
+                subdir = guided_root / f"scale_{tag}"
+                trajs = run_guided(
+                    algo,
+                    dataset,
+                    args,
+                    output_dir,
+                    device,
+                    args.format,
+                    guidance_scale=g,
+                    mode_dir=subdir,
+                )
+                sweep_runs.append(
+                    {
+                        "guidance_scale": g,
+                        "relative_dir": str(subdir.relative_to(output_dir)),
+                        "num_trajectories": len(trajs),
+                        "trajectory_npy_glob": "trajectory_*.npy",
+                    }
+                )
+            manifest = {
+                "mode": "guided_guidance_sweep",
+                "seed": args.seed,
+                "reset_seed_between_guidance_scales": not args.no_reset_seed_between_guidance_scales,
+                "num_samples_requested": args.num_samples,
+                "runs": sweep_runs,
+            }
+            manifest_path = guided_root / "guidance_sweep_manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            print(
+                f"Guidance sweep: wrote {len(scale_list)} runs under {guided_root}/scale_<tag>/ "
+                f"and {manifest_path.name}"
+            )
     elif args.mode == "guided_inpaint":
         run_guided_inpaint(algo, dataset, args, output_dir, device, args.format)
 
