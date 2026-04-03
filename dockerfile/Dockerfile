@@ -21,7 +21,6 @@ RUN pip3 install omegaconf~=2.3.0
 RUN pip3 install torchmetrics[image]==0.11.4
 RUN pip3 install wandb-osh==1.2.1
 RUN pip3 install gluonts[torch]==0.13.1
-RUN pip3 install pytorchvideo~=0.1.5
 RUN pip3 install colorama
 RUN pip3 install tqdm
 RUN pip3 install opencv-python
@@ -60,14 +59,6 @@ RUN pip3 install --upgrade torchvision
 
 # # Give the authority to the user for the mujoco_py library
 # RUN chmod -R 777 /usr/local/lib/python3.10/dist-packages/mujoco_py/generated
-
-# # Install additional libraries for OGBench
-# ENV MUJOCO_GL=egl
-# RUN apt install -y mesa-utils
-# COPY ./ogbench-1.0.1-py3-none-any.whl .
-# RUN pip3 install ./ogbench-1.0.1-py3-none-any.whl
-# RUN pip3 install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-# RUN pip3 install moviepy==1.0.3 imageio-ffmpeg
 
 # # New User (Optional)
 # ARG UNAME=jsyoon

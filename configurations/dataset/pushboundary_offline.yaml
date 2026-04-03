@@ -2,6 +2,8 @@ defaults:
   - base_dataset
 
 # Dataset identity / lengths
+# env_id: legacy string carried into DiffusionForcingPlanning / logging_utils (OGBench-style viz scaling).
+# This is not a registered PushBoundary gym env; offline data come from states_path/actions_path below.
 env_id: "pointmaze-medium-v0"
 dataset: "pushboundary_offline"
 gamma: 1.0

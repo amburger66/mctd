@@ -28,7 +28,6 @@ def start_experiment(server, gpu_id, config, exp_name, current_time):
         -v {project_dir}:/{docker_user}/mctd \
         -v {home_dir}/.netrc:/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/{docker_user}/.d4rl \
-        -v {home_dir}/.ogbench:/{docker_user}/.ogbench \
         {docker_image} /bin/bash \
         -c '"cd mctd; python3 main.py hostname={server} gpu_id={gpu_id} {command_args} "' \
         """
@@ -38,7 +37,6 @@ def start_experiment(server, gpu_id, config, exp_name, current_time):
         -v {project_dir}:/home/{docker_user}/mctd \
         -v {home_dir}/.netrc:/home/{docker_user}/.netrc \
         -v {home_dir}/.d4rl:/home/{docker_user}/.d4rl \
-        -v {home_dir}/.ogbench:/home/{docker_user}/.ogbench \
         {docker_image} /bin/bash \
         -c '"cd mctd; python3 main.py hostname={server} gpu_id={gpu_id} {command_args} "' \
         """

@@ -9,6 +9,10 @@ datasets/offline_rl/viz
 jobs/
 dql_jobs/
 
+inference_results/
+inference/
+inference_cylinder/
+
 visualizations/
 
 # Byte-compiled / optimized / DLL files

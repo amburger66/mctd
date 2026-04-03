@@ -1,7 +1,4 @@
 from datasets import (
-    Maze2dOfflineRLDataset,
-    OGMaze2dOfflineRLDataset,
-    OGAntMazeOfflineRLDataset,
     PushBoundaryOfflineRLDataset,
     CirclePaddedOfflineRLDataset,
 )
@@ -19,20 +16,6 @@ class PlanningExperiment(BaseLightningExperiment):
     )
 
     compatible_datasets = dict(
-        # Planning datasets
-        maze2d_umaze=Maze2dOfflineRLDataset,
-        maze2d_medium=Maze2dOfflineRLDataset,
-        maze2d_large=Maze2dOfflineRLDataset,
-
-        og_maze2d_medium_navigate=OGMaze2dOfflineRLDataset,
-        og_maze2d_large_navigate=OGMaze2dOfflineRLDataset,
-        og_maze2d_giant_navigate=OGMaze2dOfflineRLDataset,
-
-        og_antmaze_medium_navigate=OGAntMazeOfflineRLDataset,
-        og_antmaze_large_navigate=OGAntMazeOfflineRLDataset,
-        og_antmaze_giant_navigate=OGAntMazeOfflineRLDataset,
-        og_antmaze_teleport_navigate=OGAntMazeOfflineRLDataset,
-
         # Custom PushBoundary offline trajectories.
         pushboundary_offline=PushBoundaryOfflineRLDataset,
         pushboundary_2d_offline=PushBoundaryOfflineRLDataset,

@@ -1,5 +1,2 @@
-from .maze2d import Maze2dOfflineRLDataset
-from .og_maze2d import OGMaze2dOfflineRLDataset
-from .og_antmaze import OGAntMazeOfflineRLDataset
 from .pushboundary_offline import PushBoundaryOfflineRLDataset
 from .circle_padded_offline import CirclePaddedOfflineRLDataset
