@@ -75,6 +75,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.sub_goal_interval = cfg.sub_goal_interval
         self.viz_plans = cfg.viz_plans
         self._pushboundary_2d_viz_block_shape = cfg.get("viz_block_shape", "square")
+        self.no_sim_env = cfg.get("no_sim_env", False)
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
 
@@ -595,9 +596,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if self.guidance_scale == 0:
             namespace += "_no_guidance_random_walk"
         horizon = self.episode_len
-        self.interact(
-            batch_size, conditions, namespace
-        )  # interact if environment is installation
+        if self.no_sim_env:
+            # Extract normalized start (first frame) and goal (last frame) from the batch
+            # so interact() doesn't need an environment to source them.
+            start_obs = xs[0, :, : self.observation_dim]  # (b, obs_dim), normalized
+            goal_obs = xs[-1, :, : self.observation_dim]  # (b, obs_dim), normalized
+            self.interact(
+                batch_size, conditions, namespace,
+                start_obs=start_obs, goal_obs=goal_obs,
+            )
+        else:
+            self.interact(
+                batch_size, conditions, namespace
+            )  # interact if environment is installed
 
     def plan(
         self,
@@ -1003,7 +1014,69 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plan_hist = plan_hist[:, self.frame_stack : self.frame_stack + horizon]
         return plan_hist
 
-    def interact(self, batch_size: int, conditions=None, namespace="validation"):
+    def interact(
+        self,
+        batch_size: int,
+        conditions=None,
+        namespace="validation",
+        *,
+        start_obs=None,
+        goal_obs=None,
+    ):
+        if self.no_sim_env:
+            # No simulation environment available yet (e.g. circle_2d before ManiSkill hookup).
+            assert start_obs is not None and goal_obs is not None, (
+                "start_obs and goal_obs must be provided when no_sim_env=True"
+            )
+            obs_mean = torch.tensor(self.observation_mean, device=self.device, dtype=torch.float32)
+            obs_std  = torch.tensor(self.observation_std,  device=self.device, dtype=torch.float32)
+
+            obs_normalized  = start_obs.to(self.device).float()
+            goal_normalized = goal_obs.to(self.device).float()
+            # p_mctd_plan needs unnormalized start/goal for calculate_values
+            start_np = (obs_normalized * obs_std + obs_mean).cpu().numpy()
+            goal_np  = (goal_normalized * obs_std + obs_mean).cpu().numpy()
+
+            planning_start = time.time()
+            with torch.no_grad():
+                plan_hist = self.p_mctd_plan(
+                    obs_normalized,
+                    goal_normalized,
+                    self.episode_len,
+                    conditions,
+                    start_np,
+                    goal_np,
+                )
+            self.log(f"{namespace}/planning_time", time.time() - planning_start)
+
+            plan_hist = self._unnormalize_x(plan_hist)
+            plan = plan_hist[-1]  # (t, b, c)
+
+            out_root = (
+                Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
+                / "mctd_plans"
+                / namespace
+                / f"step_{getattr(self, 'global_step', 0):07d}"
+            )
+            out_root.mkdir(parents=True, exist_ok=True)
+
+            for i in range(min(batch_size, 4)):
+                obs_traj, _, _ = self.split_bundle(plan[:, i : i + 1, :])
+                states = obs_traj[:, 0, :].detach().cpu().numpy()
+                np.save(out_root / f"plan_{i}.npy", states)
+                self._log_or_save_pushboundary_2d_gif(
+                    namespace=namespace,
+                    states=states,
+                    sample_idx=i,
+                    gif_out_dir=out_root / "gifs",
+                    start_marker=start_np[i, :2],
+                    goal_marker=goal_np[i, :2],
+                    block_shape=self._pushboundary_2d_viz_block_shape,
+                )
+
+            # TODO: Execute plan in ManiSkill environment (once hooked up).
+            return
+
         try:
             import gym
             import ogbench

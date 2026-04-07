@@ -52,6 +52,9 @@ sub_goal_interval: 10
 viz_plans: False
 # 2D PushBoundary GIF: block geometry in BEV ("square" or "circle").
 viz_block_shape: square
+# When True, interact() runs MCTD search and saves/visualizes the plan
+# without executing it in an environment (placeholder for ManiSkill hookup).
+no_sim_env: false
 
 diffusion:
   stabilization_level: 10
