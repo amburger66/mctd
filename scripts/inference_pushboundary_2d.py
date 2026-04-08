@@ -174,9 +174,6 @@ def build_algo_and_dataset():
     experiment = build_experiment(cfg, logger=None, ckpt_path=None)
     algo = experiment._build_algo()
     dataset = experiment._build_dataset("validation")
-    import pdb
-
-    pdb.set_trace()
     return algo, dataset, cfg
 
 
