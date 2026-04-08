@@ -167,6 +167,15 @@ class CirclePaddedOfflineRLDataset(torch.utils.data.Dataset):
             act_np = act_np[:, self._action_indices]
 
         t_valid = int(min(int(self._valid_lengths[traj_idx]), self.n_frames))
+
+        # Fill any zero-padded tail with the last valid frame so that normalization
+        # never sees out-of-distribution zeros.  Zero padding is especially harmful
+        # when some dimensions have near-zero std (e.g. 1e-8): (0 - mean) / 1e-8
+        # produces ±1e8 which overflows float16 in mixed-precision training → NaN.
+        if t_valid < self.n_frames and t_valid > 0:
+            obs_np[t_valid:] = obs_np[t_valid - 1]
+            act_np[t_valid:] = act_np[t_valid - 1]
+
         nonterminal = _nonterminal_from_valid_length(self.n_frames, t_valid)
 
         observation = torch.from_numpy(obs_np.copy())

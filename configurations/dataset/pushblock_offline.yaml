@@ -1,0 +1,32 @@
+defaults:
+  - base_dataset
+
+dataset: "pushblock_offline"
+# Placeholder env_id for shared planning code paths, not a real registered env.
+env_id: "pointmaze-medium-v0"
+gamma: 1.0
+
+# n_frames = episode_len + 1 must satisfy (n_frames - 1) % frame_stack == 0.
+# With frame_stack=1 (pass algorithm.frame_stack=1), any episode_len works.
+# T_max = 50 (NPZ time dim) → n_frames <= 50 → episode_len <= 49.
+# min(valid_lengths) = 43 in this dataset; with the last-frame padding fix in
+# circle_padded_offline.py, episode_len up to 49 is now safe.
+episode_len: 48
+
+# Full 18D state and 9D action — no state_indices / action_indices slicing.
+observation_shape: [18]
+action_dim: 9
+goal_dim: 2
+
+npz_path: demos/v8_combined.npz
+
+# Computed from all valid timesteps across 1007 trajectories (50343 steps).
+# Dims 3-8 of observation and dims 2-8 of action are near-constant (gripper z-height
+# and rotation matrix rows never change), so their std is clamped to 1e-8.
+observation_mean: [-0.13931243, -0.00054828462, 0.084972583, 1, 0, 0, 0, 1, 0, -0.12801315, -0.00051449717, 0.025013341, -0.031437412, -0.01981001, -2.1968481e-07, 0.019810006, -0.031437404, 1.4146258e-06]
+observation_std:  [0.03658776, 0.045003861, 2.7420263e-05, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 0.024678463, 0.026718821, 1.5887594e-05, 0.69396907, 0.71904016, 0.00036976946, 0.71904016, 0.69396907, 0.00015328004]
+action_mean:      [-0.13943221, -0.00057164463, 0.084972583, 1, 0, 0, 0, 1, 0]
+action_std:       [0.036652613, 0.044153877, 2.7420263e-05, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8]
+
+reward_mean: 0.0
+reward_std: 1.0

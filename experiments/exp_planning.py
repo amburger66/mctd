@@ -20,4 +20,5 @@ class PlanningExperiment(BaseLightningExperiment):
         pushboundary_offline=PushBoundaryOfflineRLDataset,
         pushboundary_2d_offline=PushBoundaryOfflineRLDataset,
         circle_2d_offline=CirclePaddedOfflineRLDataset,
+        pushblock_offline=CirclePaddedOfflineRLDataset,
     )
