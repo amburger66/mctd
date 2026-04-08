@@ -31,64 +31,96 @@ sys.path.insert(0, str(_MCTD_ROOT))
 def parse_args():
     parser = argparse.ArgumentParser(description="Circle2D MCTD inference")
     parser.add_argument(
-        "--checkpoint", required=True,
+        "--checkpoint",
+        required=True,
         help="Path to .ckpt file or wandb run id (8 chars)",
     )
     parser.add_argument(
-        "--num_samples", type=int, default=1,
+        "--num_samples",
+        type=int,
+        default=1,
         help="Number of start/goal pairs to plan for (default: 1)",
     )
     parser.add_argument(
-        "--start", type=str, default=None,
+        "--start",
+        type=str,
+        default=None,
         help=(
             "Start state as x,y,bx,by (all 4 obs dims, unnormalized). "
             "E.g. --start='-0.1,0.0,-0.1,0.0'. Sampled from dataset if omitted."
         ),
     )
     parser.add_argument(
-        "--goal", type=str, default=None,
+        "--goal",
+        type=str,
+        default=None,
         help=(
             "Goal state as x,y,bx,by (all 4 obs dims, unnormalized). "
             "Sampled from dataset if omitted."
         ),
     )
     parser.add_argument(
-        "--output_dir", type=Path,
+        "--output_dir",
+        type=Path,
         default=Path("inference_results/circle_2d_mctd"),
         help="Output directory for .npy plans and GIF/MP4 visualizations",
     )
     parser.add_argument(
-        "--horizon", type=int, default=None,
+        "--horizon",
+        type=int,
+        default=None,
         help="Planning horizon in env steps (default: episode_len from config)",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--format", choices=["gif", "mp4"], default="gif",
+        "--format",
+        choices=["gif", "mp4"],
+        default="gif",
         help="Output format for trajectory visualizations (default: gif)",
     )
     parser.add_argument(
-        "--block_shape", choices=["square", "circle"], default="circle",
+        "--block_shape",
+        choices=["square", "circle"],
+        default="circle",
         help="Block geometry in BEV visualization (default: circle)",
     )
     # MCTD-specific overrides
     parser.add_argument(
-        "--max_search_num", type=int, default=None,
+        "--max_search_num",
+        type=int,
+        default=None,
         help="MCTD max search iterations (default: from config, typically 500)",
     )
     parser.add_argument(
-        "--num_denoising_steps", type=int, default=None,
+        "--num_denoising_steps",
+        type=int,
+        default=None,
         help="MCTD denoising steps per tree level (default: from config, typically 20)",
     )
     parser.add_argument(
-        "--guidance_scales", type=str, default=None,
+        "--guidance_scales",
+        type=str,
+        default="0,1,2,5,10",
+        help=("Comma-separated guidance scales for MCTD tree actions"),
+    )
+    parser.add_argument(
+        "--warp_threshold",
+        type=float,
+        default=0.04,
         help=(
-            "Comma-separated guidance scales for MCTD tree actions "
-            "(default: from config, typically '0,0.1,0.5,1,2')"
+            "Warp detection threshold in unnormalized obs-space units. "
+            "A plan frame is flagged as a teleportation artifact if its 4-D Euclidean "
+            "distance from the previous frame exceeds this value. (default: 0.04)"
         ),
     )
     parser.add_argument(
-        "--warp_threshold", type=float, default=None,
-        help="Warp detection threshold in obs-space units (default: from config)",
+        "--goal_threshold",
+        type=float,
+        default=0.05,
+        help=(
+            "Goal-achievement distance threshold in unnormalized obs-space units. "
+            "(default: 0.05)"
+        ),
     )
     return parser.parse_args()
 
@@ -103,16 +135,19 @@ def _build_hydra_overrides(args) -> list[str]:
         "algorithm.mctd=true",
         f"algorithm.viz_block_shape={args.block_shape}",
         "algorithm.no_sim_env=true",
+        "algorithm.frame_stack=10",
     ]
     if args.max_search_num is not None:
         overrides.append(f"algorithm.mctd_max_search_num={args.max_search_num}")
     if args.num_denoising_steps is not None:
-        overrides.append(f"algorithm.mctd_num_denoising_steps={args.num_denoising_steps}")
+        overrides.append(
+            f"algorithm.mctd_num_denoising_steps={args.num_denoising_steps}"
+        )
     if args.guidance_scales is not None:
         scales = "[" + args.guidance_scales + "]"
         overrides.append(f"algorithm.mctd_guidance_scales={scales}")
-    if args.warp_threshold is not None:
-        overrides.append(f"algorithm.warp_threshold={args.warp_threshold}")
+    overrides.append(f"algorithm.warp_threshold={args.warp_threshold}")
+    overrides.append(f"algorithm.goal_threshold={args.goal_threshold}")
     return overrides
 
 
@@ -189,18 +224,18 @@ def _get_start_goal_from_dataset(
     from torch.utils.data import DataLoader
 
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
-    obs_std  = np.array(algo.observation_std,  dtype=np.float32)
+    obs_std = np.array(algo.observation_std, dtype=np.float32)
 
     loader = DataLoader(dataset, batch_size=num_samples, shuffle=True, num_workers=0)
     batch = next(iter(loader))
     obs = batch[0]  # (batch, time, obs_dim) or similar layout from dataset
     obs = obs[:, :, : algo.observation_dim]
 
-    start_unnorm = obs[:, 0].float().numpy().astype(np.float32)   # (N, obs_dim)
-    goal_unnorm  = obs[:, -1].float().numpy().astype(np.float32)  # (N, obs_dim)
+    start_unnorm = obs[:, 0].float().numpy().astype(np.float32)  # (N, obs_dim)
+    goal_unnorm = obs[:, -1].float().numpy().astype(np.float32)  # (N, obs_dim)
 
     start_norm = _normalize_obs(start_unnorm, obs_mean, obs_std).to(device)
-    goal_norm  = _normalize_obs(goal_unnorm,  obs_mean, obs_std).to(device)
+    goal_norm = _normalize_obs(goal_unnorm, obs_mean, obs_std).to(device)
 
     return start_norm, goal_norm, start_unnorm, goal_unnorm
 
@@ -214,7 +249,7 @@ def run_mctd(
 ):
     """Run p_mctd_plan for each sample, save .npy and render GIF/MP4."""
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
-    obs_std  = np.array(algo.observation_std,  dtype=np.float32)
+    obs_std = np.array(algo.observation_std, dtype=np.float32)
 
     # Resolve start/goal from CLI args or dataset
     if args.start is not None and args.goal is not None:
@@ -225,9 +260,9 @@ def run_mctd(
             [[float(x) for x in args.goal.split(",")]], dtype=np.float32
         )
         start_unnorm = np.repeat(start_unnorm, args.num_samples, axis=0)
-        goal_unnorm  = np.repeat(goal_unnorm,  args.num_samples, axis=0)
+        goal_unnorm = np.repeat(goal_unnorm, args.num_samples, axis=0)
         start_norm = _normalize_obs(start_unnorm, obs_mean, obs_std).to(device)
-        goal_norm  = _normalize_obs(goal_unnorm,  obs_mean, obs_std).to(device)
+        goal_norm = _normalize_obs(goal_unnorm, obs_mean, obs_std).to(device)
     else:
         start_norm, goal_norm, start_unnorm, goal_unnorm = _get_start_goal_from_dataset(
             dataset, args.num_samples, algo, device
@@ -240,18 +275,18 @@ def run_mctd(
 
     for i in range(args.num_samples):
         print(f"[{i+1}/{args.num_samples}] Running MCTD search...")
-        start_i      = start_norm[i : i + 1].float().contiguous()  # (1, obs_dim)
-        goal_i       = goal_norm[i : i + 1].float().contiguous()
+        start_i = start_norm[i : i + 1].float().contiguous()  # (1, obs_dim)
+        goal_i = goal_norm[i : i + 1].float().contiguous()
         start_unnorm_i = start_unnorm[i : i + 1]  # (1, obs_dim)
-        goal_unnorm_i  = goal_unnorm[i : i + 1]
+        goal_unnorm_i = goal_unnorm[i : i + 1]
 
         with torch.no_grad():
             plan_hist = algo.p_mctd_plan(
                 start_i,
                 goal_i,
                 horizon,
-                None,           # conditions
-                start_unnorm_i, # unnormalized, for calculate_values
+                None,  # conditions
+                start_unnorm_i,  # unnormalized, for calculate_values
                 goal_unnorm_i,
             )
 
@@ -259,14 +294,14 @@ def run_mctd(
         plan_hist = algo._unnormalize_x(plan_hist)
         plan_final = plan_hist[-1]  # (t, 1, bundle_dim)
 
-        obs_traj, _, _ = algo.split_bundle(plan_final)       # (t, 1, obs_dim)
-        states = obs_traj[:, 0, :].detach().cpu().numpy()    # (t, obs_dim)
+        obs_traj, _, _ = algo.split_bundle(plan_final)  # (t, 1, obs_dim)
+        states = obs_traj[:, 0, :].detach().cpu().numpy()  # (t, obs_dim)
 
         np.save(output_dir / f"plan_{i}.npy", states)
         print(f"  Saved plan to {output_dir / f'plan_{i}.npy'}")
 
         start_marker = start_unnorm_i[0, :2]  # (2,) — TCP x,y
-        goal_marker  = goal_unnorm_i[0, :2]
+        goal_marker = goal_unnorm_i[0, :2]
 
         algo._log_or_save_pushboundary_2d_gif(
             namespace="mctd",

@@ -44,6 +44,10 @@ time_limit: null
 parallel_search_num: 1
 virtual_visit_weight: 1.0
 warp_threshold: 1.0
+# Distance (unnormalized obs space) below which a plan is considered to have reached the goal.
+# Pointmaze maze coords span ~20 units so 2.0 is reasonable there.
+# For small-arena tasks like circle_2d (~0.5 unit arena), set much smaller (e.g. 0.1).
+goal_threshold: 2.0
 leaf_parallelization: False
 parallel_multiple_visits: False
 early_stopping_condition: "solved"

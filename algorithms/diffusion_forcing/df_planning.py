@@ -68,6 +68,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.parallel_search_num = cfg.parallel_search_num
         self.virtual_visit_weight = cfg.virtual_visit_weight
         self.warp_threshold = cfg.warp_threshold
+        self.goal_threshold = cfg.get("goal_threshold", 2.0)
         self.leaf_parallelization = cfg.leaf_parallelization
         self.parallel_multiple_visits = cfg.parallel_multiple_visits
         self.early_stopping_condition = cfg.early_stopping_condition
@@ -85,116 +86,28 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         states: np.ndarray,
         actions: np.ndarray,
         sample_idx: int,
-        *,
-        num_frames: int = 8,
-        elev: float = 30.0,
-        azim: float = -60.0,
-        dpi: int = 100,
-        fps: float = 15.0,
-        ghost_alpha: float = 0.35,
-        show_ghost: bool = True,
+        **kwargs,
     ) -> None:
         """
-        Render a low-dim PushBoundary (18D state / 9D action) trajectory snippet as a GIF.
+        Render a low-dim PushBoundary (18D state / 9D action) trajectory as a birds-eye GIF.
 
-        Disk fallback is always used; wandb logging is best-effort only when a logger exists.
+        Delegates to _log_or_save_pushboundary_2d_gif with the correct index mapping for
+        the 18D state layout:
+          dims 0-1   gripper XY
+          dims 9-10  block XY
+          dims 12-17 block 6D rotation (first two rows of rotation matrix)
+        Block rotation (yaw) is extracted and drawn as a rotated polygon.
+        `actions` is accepted for API compatibility but is not used.
         """
-
-        # Lazily import `scripts/vis_lowdim.py` (it's not a Python package).
-        if not hasattr(self, "_pushboundary_vl"):
-            import sys
-
-            repo_root = Path(__file__).resolve().parents[4]
-            scripts_dir = repo_root / "scripts"
-            if str(scripts_dir) not in sys.path:
-                sys.path.insert(0, str(scripts_dir))
-
-            import vis_lowdim as vis_lowdim  # type: ignore
-
-            self._pushboundary_vl = vis_lowdim
-
-        vl = self._pushboundary_vl
-
-        # Cache templates for Push-v1 cube block (use_T=False).
-        if not hasattr(self, "_pushboundary_templates"):
-            rng = np.random.default_rng(0)
-            # Defaults are larger than needed; keep them modest for training-step logging.
-            self._pushboundary_templates = vl.build_templates(
-                n_block=200, n_hand=120, rng=rng, use_T=False
-            )
-
-        templates = self._pushboundary_templates
-
-        if states.ndim != 2 or states.shape[-1] != self.observation_dim:
-            raise ValueError(
-                f"Expected `states` shape [T, {self.observation_dim}], got {states.shape}"
-            )
-        if actions.ndim != 2 or actions.shape[-1] != self.action_dim:
-            raise ValueError(
-                f"Expected `actions` shape [T, {self.action_dim}], got {actions.shape}"
-            )
-
-        T = states.shape[0]
-        if T <= 0:
-            return
-
-        k = int(min(num_frames, T))
-        if k <= 1:
-            step_indices = [0]
-        else:
-            step_indices = np.linspace(0, T - 1, num=k, dtype=int).tolist()
-
-        frames = [
-            vl.extract_frame(
-                states=states,
-                actions=actions,
-                step=int(s),
-                future_step=int(s),
-                templates=templates,
-            )
-            for s in step_indices
-        ]
-
-        lims = vl._scene_limits(frames)
-        frames_img = [
-            vl.render_frame_gif(
-                frame=frame,
-                step=int(s),
-                elev=elev,
-                azim=azim,
-                lims=lims,
-                dpi=dpi,
-                ghost_alpha=ghost_alpha,
-                show_ghost=show_ghost,
-            )
-            for frame, s in zip(frames, step_indices)
-        ]
-
-        # Disk output (always).
-        root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
-        out_dir = (
-            root_dir
-            / "visualizations"
-            / "pushboundary_pcd"
-            / namespace
-            / f"global_step_{self.global_step:07d}"
+        self._log_or_save_pushboundary_2d_gif(
+            namespace=namespace,
+            states=states,
+            sample_idx=sample_idx,
+            tcp_xy_indices=(0, 1),
+            block_xy_indices=(9, 10),
+            block_rot6d_indices=(12, 13, 14, 15, 16, 17),
+            block_shape=self._pushboundary_2d_viz_block_shape,
         )
-        out_dir.mkdir(parents=True, exist_ok=True)
-        gif_path = out_dir / f"sample_{sample_idx}.gif"
-        vl.save_gif(frames_img, str(gif_path), fps=fps)
-
-        # Best-effort wandb logging (don't re-render; just log a few frames).
-        if self.logger is not None:
-            try:
-                for j in {0, len(frames_img) // 2, len(frames_img) - 1}:
-                    img = frames_img[j]
-                    self.log_image(
-                        f"training_visualization_pcd/{namespace}/sample_{sample_idx}/frame_{j}",
-                        Image.fromarray(img),
-                    )
-            except Exception:
-                # Logging should never break training.
-                pass
 
     def _log_or_save_pushboundary_2d_gif(
         self,
@@ -202,6 +115,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         states: np.ndarray,
         sample_idx: int,
         *,
+        tcp_xy_indices: tuple = (0, 1),
+        block_xy_indices: tuple = (2, 3),
+        block_rot6d_indices: Optional[tuple] = None,
         num_frames: Optional[int] = None,
         dpi: int = 100,
         fps: Optional[float] = None,
@@ -216,9 +132,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         block_shape: str = "square",
     ) -> None:
         """
-        Render a 2D PushBoundary trajectory [tcp_x, tcp_y, block_x, block_y] as a GIF or MP4.
+        Render a 2D PushBoundary trajectory as a GIF or MP4.
         Draws robot TCP (circle) and block (rectangle or circle) geometry at each frame.
-        Block uses initial pose (identity rotation) translated to predicted x,y.
+
+        tcp_xy_indices: which two state dims are gripper x,y (default (0,1)).
+        block_xy_indices: which two state dims are block x,y (default (2,3)).
+        block_rot6d_indices: if provided, a 6-tuple of state dims holding the first two
+            rows of the block rotation matrix, so the block is drawn as a rotated polygon.
+            When None the block is drawn axis-aligned.
+
         All trajectory frames are included. FPS is computed adaptively so that:
         - Short trajectories (few frames) play over at least min_duration_sec for visibility.
         - Long trajectories stay under max_gif_duration_sec.
@@ -229,17 +151,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         output_format: "gif" or "mp4".
         """
         print("Rendering pushboundary 2d visualization...")
-        if states.ndim != 2 or states.shape[-1] < 4:
+        min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
+        if states.ndim != 2 or states.shape[-1] < min_dim:
             return
-        tcp_xy = states[:, :2]
-        block_xy = states[:, 2:4]
+        tcp_xy = states[:, list(tcp_xy_indices)]
+        block_xy = states[:, list(block_xy_indices)]
+
+        if block_rot6d_indices is not None:
+            idx = block_rot6d_indices
+            block_yaws = np.arctan2(states[:, idx[3]], states[:, idx[0]])
+        else:
+            block_yaws = None
 
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.lines import Line2D
-        from matplotlib.patches import Circle, Rectangle
+        from matplotlib.patches import Circle, Polygon, Rectangle
 
         # Geometry: square block matches cube half-edge; circle matches env CIRCLE_RADIUS.
         BLOCK_HALF = 0.025
@@ -268,9 +197,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # Adaptive FPS: target duration between min_duration_sec and max_gif_duration_sec
         # so short trajs are visible, long trajs stay under max duration.
         if fps is None:
-            target_duration = np.clip(
-                T / 24.0, min_duration_sec, max_gif_duration_sec
-            )
+            target_duration = np.clip(T / 24.0, min_duration_sec, max_gif_duration_sec)
             fps = float(np.clip(T / target_duration, min_fps, max_fps))
 
         if num_frames is None or num_frames >= n_include:
@@ -301,6 +228,25 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     Circle(
                         (block_now[0], block_now[1]),
                         radius=CIRCLE_RADIUS,
+                        facecolor="#0066ff",
+                        edgecolor="#0047ab",
+                        linewidth=1,
+                        zorder=3,
+                    )
+                )
+            elif block_yaws is not None:
+                yaw = block_yaws[end - 1]
+                c, s = np.cos(yaw), np.sin(yaw)
+                h = BLOCK_HALF
+                local = [(-h, -h), (h, -h), (h, h), (-h, h)]
+                corners = [
+                    (block_now[0] + c * lx - s * ly, block_now[1] + s * lx + c * ly)
+                    for lx, ly in local
+                ]
+                ax.add_patch(
+                    Polygon(
+                        corners,
+                        closed=True,
                         facecolor="#0066ff",
                         edgecolor="#0047ab",
                         linewidth=1,
@@ -438,7 +384,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 for j in {0, len(frames_img) // 2, len(frames_img) - 1}:
                     if j < len(frames_img):
                         self.log_image(
-                            f"training_visualization_2d/{namespace}/sample_{sample_idx}/frame_{j}",
+                            f"training_visualization/{namespace}/sample_{sample_idx}/frame_{j}",
                             Image.fromarray(frames_img[j]),
                         )
             except Exception:
@@ -538,22 +484,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         xs = self._unstack_and_unnormalize(xs)[self.frame_stack - 1 :]
         xs_pred = self._unstack_and_unnormalize(xs_pred)[self.frame_stack - 1 :]
 
-        # Visualization, including masked out entries.
-        # If wandb/logging is disabled, `self.logger` can be None.
-        if self.global_step % 100 == 0 and self.logger is not None:
-            o, a, r = self.split_bundle(xs_pred)
-            trajectory = (
-                o.detach().cpu().numpy()[:-1, :8]
-            )  # last observation is dummy, sample 8
-            images = make_trajectory_images(
-                self.env_id, trajectory, trajectory.shape[1], None, None, False
-            )
-            for i, img in enumerate(images):
-                self.log_image(
-                    f"training_visualization/sample_{i}",
-                    Image.fromarray(img),
-                )
-
         # PushBoundary visualization (always saved to disk; wandb is best-effort).
         if self.global_step % 10000 == 0:
             o, a, _ = self.split_bundle(xs_pred)
@@ -602,8 +532,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             start_obs = xs[0, :, : self.observation_dim]  # (b, obs_dim), normalized
             goal_obs = xs[-1, :, : self.observation_dim]  # (b, obs_dim), normalized
             self.interact(
-                batch_size, conditions, namespace,
-                start_obs=start_obs, goal_obs=goal_obs,
+                batch_size,
+                conditions,
+                namespace,
+                start_obs=start_obs,
+                goal_obs=goal_obs,
             )
         else:
             self.interact(
@@ -869,6 +802,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         batch_size = len(plan)
         start = torch.cat([start] * batch_size, 0)
         goal = torch.cat([goal] * batch_size, 0)
+        # Pad obs-only tensors to full bundle dim (obs + zero actions), matching plan().
+        start = self.make_bundle(start)
+        goal = self.make_bundle(goal)
 
         if guidance_scale is None:
             guidance_scale = self.guidance_scale
@@ -1025,17 +961,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
     ):
         if self.no_sim_env:
             # No simulation environment available yet (e.g. circle_2d before ManiSkill hookup).
-            assert start_obs is not None and goal_obs is not None, (
-                "start_obs and goal_obs must be provided when no_sim_env=True"
+            assert (
+                start_obs is not None and goal_obs is not None
+            ), "start_obs and goal_obs must be provided when no_sim_env=True"
+            obs_mean = torch.tensor(
+                self.observation_mean, device=self.device, dtype=torch.float32
             )
-            obs_mean = torch.tensor(self.observation_mean, device=self.device, dtype=torch.float32)
-            obs_std  = torch.tensor(self.observation_std,  device=self.device, dtype=torch.float32)
+            obs_std = torch.tensor(
+                self.observation_std, device=self.device, dtype=torch.float32
+            )
 
-            obs_normalized  = start_obs.to(self.device).float()
+            obs_normalized = start_obs.to(self.device).float()
             goal_normalized = goal_obs.to(self.device).float()
             # p_mctd_plan needs unnormalized start/goal for calculate_values
             start_np = (obs_normalized * obs_std + obs_mean).cpu().numpy()
-            goal_np  = (goal_normalized * obs_std + obs_mean).cpu().numpy()
+            goal_np = (goal_normalized * obs_std + obs_mean).cpu().numpy()
 
             planning_start = time.time()
             with torch.no_grad():
@@ -1064,6 +1004,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 obs_traj, _, _ = self.split_bundle(plan[:, i : i + 1, :])
                 states = obs_traj[:, 0, :].detach().cpu().numpy()
                 np.save(out_root / f"plan_{i}.npy", states)
+                viz_kwargs = {}
+                if self.observation_dim >= 18:
+                    viz_kwargs = dict(
+                        tcp_xy_indices=(0, 1),
+                        block_xy_indices=(9, 10),
+                        block_rot6d_indices=(12, 13, 14, 15, 16, 17),
+                    )
                 self._log_or_save_pushboundary_2d_gif(
                     namespace=namespace,
                     states=states,
@@ -1072,6 +1019,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     start_marker=start_np[i, :2],
                     goal_marker=goal_np[i, :2],
                     block_shape=self._pushboundary_2d_viz_block_shape,
+                    **viz_kwargs,
                 )
 
             # TODO: Execute plan in ManiSkill environment (once hooked up).
@@ -1495,11 +1443,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
             values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
             diff_from_goal = np.linalg.norm(obs[t] - goals, axis=-1)
-            values[(diff_from_goal < 2.0) * (infos == "NotReached")] = (
+            values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 plans.shape[0] - t
             ) / plans.shape[0]
-            achieved_ts[(diff_from_goal < 2.0) * (infos == "NotReached")] = t
-            infos[(diff_from_goal < 2.0) * (infos == "NotReached")] = "Achieved"
+            achieved_ts[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = t
+            infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = "Achieved"
 
         return values, infos, achieved_ts
 
@@ -1955,10 +1903,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             ):
                 break
 
+        # goal_normalized is obs-only; make_bundle pads action dims with zeros
+        # so it matches the full-bundle channel dim of the plan tensors.
+        goal_bundle = self.make_bundle(obs=goal_normalized)  # (1, obs+act)
         if solved:
-            output_plan = torch.cat(
-                [solved_plan[:, None], goal_normalized[None]], dim=0
-            )[
+            output_plan = torch.cat([solved_plan[:, None], goal_bundle[None]], dim=0)[
                 None
             ]  # (1, t, 1, c)
         else:
@@ -1970,9 +1919,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     if value > max_value:
                         max_value = value
                         max_plan = plan
-                output_plan = torch.cat(
-                    [max_plan[:, None], goal_normalized[None]], dim=0
-                )[
+                output_plan = torch.cat([max_plan[:, None], goal_bundle[None]], dim=0)[
                     None
                 ]  # (1, t, 1, c)
             elif len(not_reached_plans) != 0:
