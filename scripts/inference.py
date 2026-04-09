@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Inference script for PushBoundary2D diffusion model.
-Loads a trained checkpoint and runs unguided (conditional completion),
-guided (goal-conditioned), or guided_inpaint (last-frame inpainting) inference.
+Inference script for PushBlock diffusion model (18D obs / 9D action).
+Loads a trained checkpoint and runs unguided (conditional completion) or
+guided (goal-conditioned).
 
 Usage (run from submodules/mctd/):
     python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode unguided
     python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --num_samples 4
-    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --start -0.2,0.0,-0.2,0.0 --goal 0.1,0.1,0.05,0.05
+
+    # 4-value shorthand: tcp_x,tcp_y,block_x,block_y  (remaining dims filled with obs mean)
+    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --start='-0.2,0.0,-0.15,0.0' --goal='0.1,0.1,0.05,0.05'
+
+    # Full 18-value spec: provide all observation dimensions directly
+    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --start='-0.2,0,...' --goal='0.1,0.1,...'
+
     python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --format mp4
     python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --guidance_scales 0.1,0.5,1,2
 """
@@ -16,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,6 +34,34 @@ _MCTD_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_MCTD_ROOT))
 
 
+def _mkdir(path: Path) -> None:
+    """mkdir -p with 0o777 permissions, bypassing the process umask.
+
+    When the script runs inside Docker as root, directories created with the
+    default umask (022) end up as root:root 755 on the bind-mounted host
+    filesystem — the host user can read but not write them.  Forcing 0o777
+    makes every new directory component world-writable so the host user can
+    delete, rename, or overwrite outputs without sudo.
+    """
+    prev = os.umask(0)
+    try:
+        path.mkdir(mode=0o777, parents=True, exist_ok=True)
+    finally:
+        os.umask(prev)
+
+
+# Indices within the 18-D pushblock observation vector.
+_TCP_XY_IDX = (0, 1)
+_BLOCK_XY_IDX = (9, 10)
+_BLOCK_ROT6D_IDX = (12, 13, 14, 15, 16, 17)
+
+# 4-value shorthand: (tcp_x, tcp_y, block_x, block_y) → obs dims 0,1,9,10.
+_SHORTHAND_4D_MAP = [0, 1, 9, 10]
+
+# Set from args in main() before load_config() is called.
+_FRAME_STACK: int = 4
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="PushBoundary2D inference")
     parser.add_argument(
@@ -34,7 +69,7 @@ def parse_args():
     )
     parser.add_argument(
         "--mode",
-        choices=["unguided", "guided", "guided_inpaint"],
+        choices=["unguided", "guided"],
         default="unguided",
         help="Inference mode",
     )
@@ -50,14 +85,21 @@ def parse_args():
     parser.add_argument(
         "--start",
         type=str,
-        default=None,
-        help="Start state as tcp_x,tcp_y,block_x,block_y (guided mode). Use --start='-0.2,0,0,0' for negative values.",
+        default="-1.2423071e-01,  1.0210365e-01,  8.5000001e-02,  1.0000000e+00,0.0000000e+00,  0.0000000e+00,  0.0000000e+00,  1.0000000e+00,0.0000000e+00, -1.3499984e-01,  8.8226318e-07,  2.4999909e-02,-9.6900570e-01,  2.4703912e-01, -1.3709006e-06, -2.4703912e-01,-9.6900570e-01,  1.2516976e-05",
+        help=(
+            "Start observation for guided mode. Either 4 values (tcp_x,tcp_y,block_x,block_y) "
+            "as a shorthand — remaining dims filled with obs mean — or the full 18-value "
+            "observation vector. Use --start='-0.2,0,-0.15,0' for negative values."
+        ),
     )
     parser.add_argument(
         "--goal",
         type=str,
         default=None,
-        help="Goal state as tcp_x,tcp_y,block_x,block_y (guided mode). Use --goal='x,y,z,w' format.",
+        help=(
+            "Goal observation for guided mode. Same format as --start: 4-value shorthand "
+            "(tcp_x,tcp_y,block_x,block_y) or full 18-value vector."
+        ),
     )
     parser.add_argument(
         "--guidance_scale",
@@ -83,6 +125,12 @@ def parse_args():
         type=int,
         default=None,
         help="Planning horizon in env steps (default: episode_len)",
+    )
+    parser.add_argument(
+        "--frame_stack",
+        type=int,
+        default=4,
+        help="frame_stack used during training (default: 4)",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -140,15 +188,16 @@ def load_config():
             config_name="config",
             overrides=[
                 "experiment=exp_planning",
-                "dataset=pushboundary_2d_offline",
+                "dataset=pushblock_offline",
                 "algorithm=df_planning",
-                "+name=PushBoundary2D",
+                "+name=PushBlock",
                 "wandb.mode=disabled",
+                f"algorithm.frame_stack={_FRAME_STACK}",
             ],
         )
     with open_dict(cfg):
         cfg.experiment._name = "exp_planning"
-        cfg.dataset._name = "pushboundary_2d_offline"
+        cfg.dataset._name = "pushblock_offline"
         cfg.algorithm._name = "df_planning"
     return cfg
 
@@ -170,7 +219,7 @@ def build_algo_and_dataset():
     from experiments import build_experiment
 
     cfg = load_config()
-    print(cfg)
+    # print(cfg)
     experiment = build_experiment(cfg, logger=None, ckpt_path=None)
     algo = experiment._build_algo()
     dataset = experiment._build_dataset("validation")
@@ -197,9 +246,17 @@ def run_unguided(
     output_format: str = "gif",
     mode_dir: Path | None = None,
     block_shape: str = "square",
+    horizon: int | None = None,
 ):
     """
-    Unguided conditional completion.
+    Unguided rollout via ``algo.plan(..., guidance_scale=0)``.
+
+    For each batch, the first observation of each trajectory (from the shuffled
+    validation loader) is used as the start; ``goal`` is a dummy (cloned start)
+    and is ignored because guidance is disabled. Length is ``H + 1`` frames
+    (start plus ``H`` planned steps), where ``H`` is ``--horizon`` if set, else
+    ``algo.episode_len``.
+
     If ``mode_dir`` is None, writes under ``output_dir / "unguided"``.
     """
     from torch.utils.data import DataLoader
@@ -209,10 +266,16 @@ def run_unguided(
     )
     if mode_dir is None:
         mode_dir = output_dir / "unguided"
-    mode_dir.mkdir(parents=True, exist_ok=True)
+    _mkdir(mode_dir)
 
     algo.eval()
-    n_context_frames = algo.context_frames // algo.frame_stack
+    H = horizon if horizon is not None else algo.episode_len
+    obs_mean = np.array(algo.observation_mean, dtype=np.float32)
+    obs_std = np.array(algo.observation_std, dtype=np.float32)
+    obs_mean_t = torch.from_numpy(obs_mean).to(device).float()
+    obs_std_t = torch.from_numpy(obs_std).to(device).float()
+    model_device = next(algo.parameters()).device
+
     trajectories = []
     sample_idx = 0
 
@@ -220,65 +283,43 @@ def run_unguided(
         if sample_idx >= num_samples:
             break
         batch = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in batch)
+        observations = batch[0][..., : algo.observation_dim].float()
+        batch_size = observations.shape[0]
+        start_norm = (observations[:, 0] - obs_mean_t) / obs_std_t
+        goal_norm = start_norm.clone()
+        start_norm = start_norm.to(model_device).contiguous()
+        goal_norm = goal_norm.to(model_device).contiguous()
+
         with torch.no_grad():
-            xs, conditions, masks = algo._preprocess_batch(batch)
-        n_frames, batch_size, *_ = xs.shape
-        xs_pred = xs[:n_context_frames].clone()
-        curr_frame = n_context_frames
+            plan_hist = algo.plan(start_norm, goal_norm, H)
+        plan_final = plan_hist[-1]
 
-        while curr_frame < n_frames:
-            horizon = min(n_frames - curr_frame, algo.chunk_size)
-            scheduling_matrix = algo._generate_scheduling_matrix(horizon)
-
-            chunk = torch.randn(
-                (horizon, batch_size, *algo.x_stacked_shape), device=device
-            )
-            chunk = torch.clamp(chunk, -algo.clip_noise, algo.clip_noise)
-            xs_pred = torch.cat([xs_pred, chunk], 0)
-
-            start_frame = max(0, curr_frame + horizon - algo.n_tokens)
-
-            for m in range(scheduling_matrix.shape[0] - 1):
-                from_noise = np.concatenate(
-                    (np.zeros((curr_frame,), dtype=np.int64), scheduling_matrix[m])
-                )[:, None].repeat(batch_size, axis=1)
-                to_noise = np.concatenate(
-                    (np.zeros((curr_frame,), dtype=np.int64), scheduling_matrix[m + 1])
-                )[:, None].repeat(batch_size, axis=1)
-                from_noise = torch.from_numpy(from_noise).to(device)
-                to_noise = torch.from_numpy(to_noise).to(device)
-
-                cond = (
-                    None
-                    if conditions is None
-                    else conditions[start_frame : curr_frame + horizon]
-                )
-                xs_pred[start_frame:] = algo.diffusion_model.sample_step(
-                    xs_pred[start_frame:],
-                    cond,
-                    from_noise[start_frame:],
-                    to_noise[start_frame:],
-                )
-
-            curr_frame += horizon
-
-        xs_pred = algo._unstack_and_unnormalize(xs_pred)
-        obs, _, _ = algo.split_bundle(xs_pred)
-        obs_np = obs.detach().cpu().numpy()
-
-        for b in range(obs_np.shape[1]):
+        for i in range(batch_size):
             if sample_idx >= num_samples:
                 break
-            states = obs_np[:, b, :].astype(np.float32)
+            pf = plan_final[:, i : i + 1, :]
+            plan_unnorm = algo._unnormalize_x(pf)
+            obs_unnorm, _, _ = algo.split_bundle(plan_unnorm)
+            start_unnorm = (start_norm[i] * obs_std_t + obs_mean_t).unsqueeze(0)
+            start_obs = start_unnorm[:, : algo.observation_dim].unsqueeze(1)
+            full_traj = torch.cat(
+                [start_obs, obs_unnorm[:, : algo.observation_dim]],
+                0,
+            )
+            states = full_traj.detach().cpu().numpy().astype(np.float32)
             trajectories.append(states)
             np.save(mode_dir / f"trajectory_{sample_idx}.npy", states)
             viz_dir = (
                 mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
             )
+            states_2d = states.squeeze(1)
             algo._log_or_save_pushboundary_2d_gif(
                 namespace="unguided",
-                states=states,
+                states=states_2d,
                 sample_idx=sample_idx,
+                tcp_xy_indices=_TCP_XY_IDX,
+                block_xy_indices=_BLOCK_XY_IDX,
+                block_rot6d_indices=_BLOCK_ROT6D_IDX,
                 gif_out_dir=viz_dir,
                 output_format=output_format,
                 block_shape=block_shape,
@@ -286,6 +327,29 @@ def run_unguided(
             sample_idx += 1
 
     return trajectories
+
+
+def _expand_obs_shorthand(values: list[float], obs_mean: np.ndarray) -> np.ndarray:
+    """
+    Expand a user-provided observation specification to the full obs_dim.
+
+    - If len(values) == obs_dim: used directly.
+    - If len(values) == 4: treated as (tcp_x, tcp_y, block_x, block_y), mapped to
+      dims 0,1,9,10; all other dims filled from obs_mean.
+    - Otherwise: raises ValueError.
+    """
+    obs_dim = len(obs_mean)
+    if len(values) == obs_dim:
+        return np.array(values, dtype=np.float32)
+    if len(values) == 4:
+        obs = obs_mean.copy()
+        for dst, src in zip(_SHORTHAND_4D_MAP, values):
+            obs[dst] = src
+        return obs.astype(np.float32)
+    raise ValueError(
+        f"--start/--goal must have 4 values (tcp_x,tcp_y,block_x,block_y shorthand) "
+        f"or {obs_dim} values (full observation); got {len(values)}."
+    )
 
 
 def _normalize_obs(obs: np.ndarray, mean: np.ndarray, std: np.ndarray) -> torch.Tensor:
@@ -329,16 +393,12 @@ def run_guided(
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
     if args.start is not None and args.goal is not None:
-        start_norm = _normalize_obs(
-            np.array([[float(x) for x in args.start.split(",")]], dtype=np.float32),
-            obs_mean,
-            obs_std,
-        ).to(device)
-        goal_norm = _normalize_obs(
-            np.array([[float(x) for x in args.goal.split(",")]], dtype=np.float32),
-            obs_mean,
-            obs_std,
-        ).to(device)
+        start_vals = [float(x) for x in args.start.split(",")]
+        goal_vals = [float(x) for x in args.goal.split(",")]
+        start_obs = _expand_obs_shorthand(start_vals, obs_mean)
+        goal_obs = _expand_obs_shorthand(goal_vals, obs_mean)
+        start_norm = _normalize_obs(start_obs[None], obs_mean, obs_std).to(device)
+        goal_norm = _normalize_obs(goal_obs[None], obs_mean, obs_std).to(device)
         start_norm = start_norm.repeat(args.num_samples, 1)
         goal_norm = goal_norm.repeat(args.num_samples, 1)
     else:
@@ -356,7 +416,7 @@ def run_guided(
 
     if mode_dir is None:
         mode_dir = output_dir / "guided"
-    mode_dir.mkdir(parents=True, exist_ok=True)
+    _mkdir(mode_dir)
     viz_dir = mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
 
     model_device = next(algo.parameters()).device
@@ -387,90 +447,19 @@ def run_guided(
         goal_unnorm = goal_norm[i] * torch.from_numpy(obs_std).to(
             device
         ) + torch.from_numpy(obs_mean).to(device)
-        start_marker = start_unnorm[0, 2:4].detach().cpu().numpy().astype(np.float32)
-        goal_marker = goal_unnorm[2:4].detach().cpu().numpy().astype(np.float32)
+        bxi, byi = _BLOCK_XY_IDX
+        start_marker = (
+            start_unnorm[0, [bxi, byi]].detach().cpu().numpy().astype(np.float32)
+        )
+        goal_marker = goal_unnorm[[bxi, byi]].detach().cpu().numpy().astype(np.float32)
         states_2d = states.squeeze(1)
         algo._log_or_save_pushboundary_2d_gif(
             namespace="guided",
             states=states_2d,
             sample_idx=i,
-            gif_out_dir=viz_dir,
-            start_marker=start_marker,
-            goal_marker=goal_marker,
-            output_format=output_format,
-            block_shape=args.block_shape,
-        )
-    return trajectories
-
-
-def run_guided_inpaint(
-    algo,
-    dataset,
-    args,
-    output_dir: Path,
-    device: torch.device,
-    output_format: str = "gif",
-):
-    obs_mean = np.array(algo.observation_mean, dtype=np.float32)
-    obs_std = np.array(algo.observation_std, dtype=np.float32)
-
-    if args.start is not None and args.goal is not None:
-        start_norm = _normalize_obs(
-            np.array([[float(x) for x in args.start.split(",")]], dtype=np.float32),
-            obs_mean,
-            obs_std,
-        ).to(device)
-        goal_norm = _normalize_obs(
-            np.array([[float(x) for x in args.goal.split(",")]], dtype=np.float32),
-            obs_mean,
-            obs_std,
-        ).to(device)
-        start_norm = start_norm.repeat(args.num_samples, 1)
-        goal_norm = goal_norm.repeat(args.num_samples, 1)
-    else:
-        start_norm, goal_norm = _get_start_goal_from_dataset(
-            dataset, args.num_samples, algo, device
-        )
-
-    horizon = args.horizon if args.horizon is not None else algo.episode_len
-
-    mode_dir = output_dir / "guided_inpaint"
-    mode_dir.mkdir(parents=True, exist_ok=True)
-    viz_dir = mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
-
-    model_device = next(algo.parameters()).device
-    trajectories = []
-    batch_size = start_norm.shape[0]
-    for i in range(batch_size):
-        start_i = start_norm[i : i + 1].to(model_device).float().contiguous()
-        goal_i = goal_norm[i : i + 1].to(model_device).float().contiguous()
-        with torch.no_grad():
-            plan_hist = algo.plan_inpaint(start_i, goal_i, horizon)
-        plan_final = plan_hist[0]
-        plan_unnorm = algo._unnormalize_x(plan_final)
-        obs_unnorm, _, _ = algo.split_bundle(plan_unnorm)
-        start_unnorm = (
-            start_norm[i] * torch.from_numpy(obs_std).to(device)
-            + torch.from_numpy(obs_mean).to(device)
-        ).unsqueeze(0)
-        start_obs = start_unnorm[:, : algo.observation_dim].unsqueeze(1)
-        full_traj = torch.cat(
-            [start_obs, obs_unnorm[:, : algo.observation_dim]],
-            0,
-        )
-        states = full_traj.detach().cpu().numpy().astype(np.float32)
-        trajectories.append(states)
-        np.save(mode_dir / f"trajectory_{i}.npy", states)
-        goal_unnorm = goal_norm[i] * torch.from_numpy(obs_std).to(
-            device
-        ) + torch.from_numpy(obs_mean).to(device)
-        start_marker = start_unnorm[0, 2:4].detach().cpu().numpy().astype(np.float32)
-        goal_marker = goal_unnorm[2:4].detach().cpu().numpy().astype(np.float32)
-        states_2d = states.squeeze(1)
-        algo._log_or_save_pushboundary_2d_gif(
-            namespace="guided_inpaint",
-            states=states_2d,
-            sample_idx=i,
+            tcp_xy_indices=_TCP_XY_IDX,
+            block_xy_indices=_BLOCK_XY_IDX,
+            block_rot6d_indices=_BLOCK_ROT6D_IDX,
             gif_out_dir=viz_dir,
             start_marker=start_marker,
             goal_marker=goal_marker,
@@ -481,7 +470,9 @@ def run_guided_inpaint(
 
 
 def main():
+    global _FRAME_STACK
     args = parse_args()
+    _FRAME_STACK = args.frame_stack
     if (
         args.guidance_scales is not None
         and str(args.guidance_scales).strip()
@@ -500,7 +491,7 @@ def main():
     algo = load_checkpoint(algo, ckpt_path, device)
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _mkdir(output_dir)
 
     if args.mode == "unguided":
         run_unguided(
@@ -511,6 +502,7 @@ def main():
             device,
             args.format,
             block_shape=args.block_shape,
+            horizon=args.horizon,
         )
     elif args.mode == "guided":
         scale_list = _parse_guidance_scales(args.guidance_scales)
@@ -518,7 +510,7 @@ def main():
             run_guided(algo, dataset, args, output_dir, device, args.format)
         else:
             guided_root = output_dir / "guided"
-            guided_root.mkdir(parents=True, exist_ok=True)
+            _mkdir(guided_root)
             sweep_runs: list[dict] = []
             for g in scale_list:
                 if not args.no_reset_seed_between_guidance_scales:
@@ -557,8 +549,6 @@ def main():
                 f"Guidance sweep: wrote {len(scale_list)} runs under {guided_root}/scale_<tag>/ "
                 f"and {manifest_path.name}"
             )
-    elif args.mode == "guided_inpaint":
-        run_guided_inpaint(algo, dataset, args, output_dir, device, args.format)
 
     print(f"Outputs saved to {output_dir}")
 
