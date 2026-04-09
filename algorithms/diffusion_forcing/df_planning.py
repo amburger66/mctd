@@ -159,7 +159,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         if block_rot6d_indices is not None:
             idx = block_rot6d_indices
-            block_yaws = np.arctan2(states[:, idx[3]], states[:, idx[0]])
+            # Zhou et al. 2018 columns convention:
+            # 6D = [col0, col1] = [R00,R10,R20, R01,R11,R21]
+            # For yaw θ: idx[0]=cosθ, idx[1]=sinθ → atan2(sinθ, cosθ)
+            block_yaws = np.arctan2(states[:, idx[1]], states[:, idx[0]])
         else:
             block_yaws = None
 
@@ -354,7 +357,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 / namespace
                 / f"global_step_{getattr(self, 'global_step', 0):07d}"
             )
-        out_dir.mkdir(parents=True, exist_ok=True)
+        import os as _os
+
+        _prev = _os.umask(0)
+        try:
+            out_dir.mkdir(mode=0o777, parents=True, exist_ok=True)
+        finally:
+            _os.umask(_prev)
         ext = "mp4" if output_format == "mp4" else "gif"
         out_path = out_dir / f"sample_{sample_idx}.{ext}"
 
@@ -1446,8 +1455,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 plans.shape[0] - t
             ) / plans.shape[0]
-            achieved_ts[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = t
-            infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = "Achieved"
+            achieved_ts[
+                (diff_from_goal < self.goal_threshold) * (infos == "NotReached")
+            ] = t
+            infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
+                "Achieved"
+            )
 
         return values, infos, achieved_ts
 
