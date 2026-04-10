@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Inference script for PushBlock diffusion model (18D obs / 9D action).
+Inference script for Cylinder diffusion model (4D obs / 2D action).
 Loads a trained checkpoint and runs unguided (conditional completion) or
 guided (goal-conditioned).
 
 Usage (run from submodules/mctd/):
-    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode unguided
-    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --num_samples 4
+    python scripts/inference.py --checkpoint path/to/model.ckpt --mode unguided
+    python scripts/inference.py --checkpoint path/to/model.ckpt --mode guided --num_samples 4
 
     # 4-value shorthand: tcp_x,tcp_y,block_x,block_y  (remaining dims filled with obs mean)
-    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --start='-0.2,0.0,-0.15,0.0' --goal='0.1,0.1,0.05,0.05'
+    python scripts/inference.py --checkpoint path/to/model.ckpt --mode guided --start='-0.2,0.0,-0.15,0.0' --goal='0.1,0.1,0.05,0.05'
 
     # Full 18-value spec: provide all observation dimensions directly
-    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --start='-0.2,0,...' --goal='0.1,0.1,...'
+    python scripts/inference.py --checkpoint path/to/model.ckpt --mode guided --start='-0.2,0,...' --goal='0.1,0.1,...'
 
-    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --format mp4
-    python scripts/inference_pushboundary_2d.py --checkpoint path/to/model.ckpt --mode guided --guidance_scales 0.1,0.5,1,2
+    python scripts/inference.py --checkpoint path/to/model.ckpt --mode guided --format mp4
+    python scripts/inference.py --checkpoint path/to/model.ckpt --mode guided --guidance_scales 0.1,0.5,1,2
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ _BLOCK_ROT6D_IDX = (12, 13, 14, 15, 16, 17)
 _SHORTHAND_4D_MAP = [0, 1, 9, 10]
 
 # Set from args in main() before load_config() is called.
-_FRAME_STACK: int = 4
+_FRAME_STACK: int = 10
 
 
 def parse_args():
@@ -79,13 +79,13 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("inference_results/pushboundary_2d"),
+        default=Path("inference_results/cylinder"),
         help="Output directory for visualizations (GIF/MP4) and trajectories",
     )
     parser.add_argument(
         "--start",
         type=str,
-        default="-1.2423071e-01,  1.0210365e-01,  8.5000001e-02,  1.0000000e+00,0.0000000e+00,  0.0000000e+00,  0.0000000e+00,  1.0000000e+00,0.0000000e+00, -1.3499984e-01,  8.8226318e-07,  2.4999909e-02,-9.6900570e-01,  2.4703912e-01, -1.3709006e-06, -2.4703912e-01,-9.6900570e-01,  1.2516976e-05",
+        default="-0.2430062,-0.00169962,-0.13169734,-0.03726087",  # From dataset[0]
         help=(
             "Start observation for guided mode. Either 4 values (tcp_x,tcp_y,block_x,block_y) "
             "as a shorthand — remaining dims filled with obs mean — or the full 18-value "
@@ -129,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--frame_stack",
         type=int,
-        default=4,
+        default=10,
         help="frame_stack used during training (default: 4)",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -150,7 +150,7 @@ def parse_args():
     parser.add_argument(
         "--block_shape",
         choices=["square", "circle"],
-        default="square",
+        default="circle",
         help="BEV block geometry in GIF/MP4 (circle matches envs/push_boundary.py CIRCLE_RADIUS)",
     )
     return parser.parse_args()
@@ -188,16 +188,16 @@ def load_config():
             config_name="config",
             overrides=[
                 "experiment=exp_planning",
-                "dataset=pushblock_offline",
+                "dataset=circle_2d_offline",
                 "algorithm=df_planning",
-                "+name=PushBlock",
+                "+name=PushCylinder2D",
                 "wandb.mode=disabled",
                 f"algorithm.frame_stack={_FRAME_STACK}",
             ],
         )
     with open_dict(cfg):
         cfg.experiment._name = "exp_planning"
-        cfg.dataset._name = "pushblock_offline"
+        cfg.dataset._name = "circle_2d_offline"
         cfg.algorithm._name = "df_planning"
     return cfg
 
