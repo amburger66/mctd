@@ -278,6 +278,7 @@ def run_unguided(
 
     trajectories = []
     sample_idx = 0
+    tcp_xy_indices, block_xy_indices, block_rot6d_indices = _infer_viz_indices(algo)
 
     for batch_idx, batch in enumerate(dataloader):
         if sample_idx >= num_samples:
@@ -308,18 +309,25 @@ def run_unguided(
             )
             states = full_traj.detach().cpu().numpy().astype(np.float32)
             trajectories.append(states)
-            np.save(mode_dir / f"trajectory_{sample_idx}.npy", states)
+            states_2d = states.squeeze(1)
+            np.savez(
+                mode_dir / f"trajectory_{sample_idx}.npz",
+                states=states_2d.astype(np.float32),
+                source="diffuser_inference",
+                version=np.int32(1),
+                mode="unguided",
+                horizon=np.int32(H),
+            )
             viz_dir = (
                 mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
             )
-            states_2d = states.squeeze(1)
             algo._log_or_save_pushboundary_2d_gif(
                 namespace="unguided",
                 states=states_2d,
                 sample_idx=sample_idx,
-                tcp_xy_indices=_TCP_XY_IDX,
-                block_xy_indices=_BLOCK_XY_IDX,
-                block_rot6d_indices=_BLOCK_ROT6D_IDX,
+                tcp_xy_indices=tcp_xy_indices,
+                block_xy_indices=block_xy_indices,
+                block_rot6d_indices=block_rot6d_indices,
                 gif_out_dir=viz_dir,
                 output_format=output_format,
                 block_shape=block_shape,
@@ -354,6 +362,36 @@ def _expand_obs_shorthand(values: list[float], obs_mean: np.ndarray) -> np.ndarr
 
 def _normalize_obs(obs: np.ndarray, mean: np.ndarray, std: np.ndarray) -> torch.Tensor:
     return torch.from_numpy((obs - mean) / std).float()
+
+
+def _infer_viz_indices(
+    algo,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, ...] | None]:
+    """
+    Determine indices for TCP XY, block XY, and (optionally) block rot6d in the
+    current observation representation.
+
+    For the circle 2D offline dataset, observations are 4D:
+        [tcp_x, tcp_y, block_x, block_y]
+    because the dataset slices the original 18D pushblock state via
+    state_indices [0, 1, 9, 10].
+    """
+    obs_dim = int(getattr(algo, "observation_dim", 0))
+    if obs_dim == 4:
+        # No rotation channels exist in the 4D representation.
+        return (0, 1), (2, 3), None
+    return _TCP_XY_IDX, _BLOCK_XY_IDX, _BLOCK_ROT6D_IDX
+
+
+def _block_xy_from_obs_unnorm(obs_unnorm_1d: torch.Tensor, algo) -> np.ndarray:
+    """Extract unnormalised block XY from a 1D observation tensor."""
+    obs_dim = int(getattr(algo, "observation_dim", 0))
+    if obs_dim == 4:
+        xy = obs_unnorm_1d[[2, 3]]
+    else:
+        bxi, byi = _BLOCK_XY_IDX
+        xy = obs_unnorm_1d[[bxi, byi]]
+    return xy.detach().cpu().numpy().astype(np.float32)
 
 
 def _get_start_goal_from_dataset(dataset, num_samples, algo, device):
@@ -422,6 +460,7 @@ def run_guided(
     model_device = next(algo.parameters()).device
     trajectories = []
     batch_size = start_norm.shape[0]
+    tcp_xy_indices, block_xy_indices, block_rot6d_indices = _infer_viz_indices(algo)
     for i in range(batch_size):
         start_i = start_norm[i : i + 1].to(model_device).float().contiguous()
         goal_i = goal_norm[i : i + 1].to(model_device).float().contiguous()
@@ -443,23 +482,30 @@ def run_guided(
         )
         states = full_traj.detach().cpu().numpy().astype(np.float32)
         trajectories.append(states)
-        np.save(mode_dir / f"trajectory_{i}.npy", states)
-        goal_unnorm = goal_norm[i] * torch.from_numpy(obs_std).to(
-            device
-        ) + torch.from_numpy(obs_mean).to(device)
-        bxi, byi = _BLOCK_XY_IDX
-        start_marker = (
-            start_unnorm[0, [bxi, byi]].detach().cpu().numpy().astype(np.float32)
-        )
-        goal_marker = goal_unnorm[[bxi, byi]].detach().cpu().numpy().astype(np.float32)
         states_2d = states.squeeze(1)
+        goal_unnorm = (
+            goal_norm[i] * torch.from_numpy(obs_std).to(device)
+            + torch.from_numpy(obs_mean).to(device)
+        )
+        start_marker = _block_xy_from_obs_unnorm(start_unnorm[0], algo)
+        goal_marker = _block_xy_from_obs_unnorm(goal_unnorm, algo)
+        np.savez(
+            mode_dir / f"trajectory_{i}.npz",
+            states=states_2d.astype(np.float32),
+            target_xy=goal_marker.astype(np.float32),
+            source="diffuser_inference",
+            version=np.int32(1),
+            mode="guided",
+            guidance_scale=np.float32(guidance_scale),
+            horizon=np.int32(horizon),
+        )
         algo._log_or_save_pushboundary_2d_gif(
             namespace="guided",
             states=states_2d,
             sample_idx=i,
-            tcp_xy_indices=_TCP_XY_IDX,
-            block_xy_indices=_BLOCK_XY_IDX,
-            block_rot6d_indices=_BLOCK_ROT6D_IDX,
+            tcp_xy_indices=tcp_xy_indices,
+            block_xy_indices=block_xy_indices,
+            block_rot6d_indices=block_rot6d_indices,
             gif_out_dir=viz_dir,
             start_marker=start_marker,
             goal_marker=goal_marker,

@@ -3,7 +3,7 @@
 MCTD inference script for the circle_2d model.
 
 Loads a trained checkpoint, runs p_mctd_plan() for each start/goal pair,
-saves the resulting plan as a .npy file and renders it as a GIF or MP4.
+saves the resulting plan as a .npz file and renders it as a GIF or MP4.
 No environment execution is performed (placeholder for ManiSkill hookup).
 
 Usage (run from submodules/mctd/):
@@ -63,7 +63,7 @@ def parse_args():
         "--output_dir",
         type=Path,
         default=Path("inference_results/circle_2d_mctd"),
-        help="Output directory for .npy plans and GIF/MP4 visualizations",
+        help="Output directory for raw .npz plans and GIF/MP4 visualizations",
     )
     parser.add_argument(
         "--horizon",
@@ -247,7 +247,7 @@ def run_mctd(
     output_dir: Path,
     device: torch.device,
 ):
-    """Run p_mctd_plan for each sample, save .npy and render GIF/MP4."""
+    """Run p_mctd_plan for each sample, save raw .npz and render GIF/MP4."""
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
@@ -297,11 +297,27 @@ def run_mctd(
         obs_traj, _, _ = algo.split_bundle(plan_final)  # (t, 1, obs_dim)
         states = obs_traj[:, 0, :].detach().cpu().numpy()  # (t, obs_dim)
 
-        np.save(output_dir / f"plan_{i}.npy", states)
-        print(f"  Saved plan to {output_dir / f'plan_{i}.npy'}")
+        # Raw 2D NPZ format compatible with:
+        #   python scripts/playback_floating.py --raw_npz <file> --conversion_mode 2d
+        #
+        # states: (T,4) ordered [tcp_x, tcp_y, block_x, block_y]
+        target_xy = goal_unnorm_i[0, 2:4].astype(np.float32)  # block XY
+        out_path = output_dir / f"plan_{i}.npz"
+        np.savez(
+            out_path,
+            states=states.astype(np.float32),
+            target_xy=target_xy,
+            source="mctd_inference",
+            version=np.int32(1),
+            mode="guided",
+            horizon=np.int32(horizon),
+            seed=np.int32(args.seed),
+        )
+        print(f"  Saved plan to {out_path}")
 
-        start_marker = start_unnorm_i[0, :2]  # (2,) — TCP x,y
-        goal_marker = goal_unnorm_i[0, :2]
+        # Markers: block XY for start/goal visualization
+        start_marker = start_unnorm_i[0, 2:4]
+        goal_marker = goal_unnorm_i[0, 2:4]
 
         algo._log_or_save_pushboundary_2d_gif(
             namespace="mctd",
