@@ -108,7 +108,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             block_rot6d_indices=(12, 13, 14, 15, 16, 17),
             block_shape=self._pushboundary_2d_viz_block_shape,
         )
-        
+
     def _log_or_save_pushboundary_2d_gif(
         self,
         namespace: str,
@@ -117,7 +117,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         *,
         tcp_xy_indices: tuple = (0, 1),
         block_xy_indices: tuple = (2, 3),
-        block_yaw_indices: Optional[tuple] = (4, 5),  # Updated to expect (cos, sin) indices
+        block_yaw_indices: Optional[tuple] = (
+            4,
+            5,
+        ),  # Updated to expect (cos, sin) indices
         num_frames: Optional[int] = None,
         dpi: int = 100,
         fps: Optional[float] = None,
@@ -234,7 +237,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 h = BLOCK_HALF
                 local = [(-h, -h), (h, -h), (h, h), (-h, h)]
                 corners = [
-                    (block_now[0] + c * lx - s_val * ly, block_now[1] + s_val * lx + c * ly)
+                    (
+                        block_now[0] + c * lx - s_val * ly,
+                        block_now[1] + s_val * lx + c * ly,
+                    )
                     for lx, ly in local
                 ]
                 ax.add_patch(
@@ -389,296 +395,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         )
             except Exception:
                 pass
-
-    # def _log_or_save_pushboundary_2d_gif(
-    #     self,
-    #     namespace: str,
-    #     states: np.ndarray,
-    #     sample_idx: int,
-    #     *,
-    #     tcp_xy_indices: tuple = (0, 1),
-    #     block_xy_indices: tuple = (2, 3),
-    #     block_rot6d_indices: Optional[tuple] = None,
-    #     num_frames: Optional[int] = None,
-    #     dpi: int = 100,
-    #     fps: Optional[float] = None,
-    #     min_fps: float = 10.0,
-    #     max_fps: float = 60.0,
-    #     min_duration_sec: float = 4.0,
-    #     max_gif_duration_sec: float = 20.0,
-    #     gif_out_dir: Optional[Path] = None,
-    #     start_marker: Optional[np.ndarray] = None,
-    #     goal_marker: Optional[np.ndarray] = None,
-    #     output_format: str = "gif",
-    #     block_shape: str = "square",
-    # ) -> None:
-    #     """
-    #     Render a 2D PushBoundary trajectory as a GIF or MP4.
-    #     Draws robot TCP (circle) and block (rectangle or circle) geometry at each frame.
-
-    #     tcp_xy_indices: which two state dims are gripper x,y (default (0,1)).
-    #     block_xy_indices: which two state dims are block x,y (default (2,3)).
-    #     block_rot6d_indices: if provided, a 6-tuple of state dims holding the first two
-    #         rows of the block rotation matrix, so the block is drawn as a rotated polygon.
-    #         When None the block is drawn axis-aligned.
-
-    #     All trajectory frames are included. FPS is computed adaptively so that:
-    #     - Short trajectories (few frames) play over at least min_duration_sec for visibility.
-    #     - Long trajectories stay under max_gif_duration_sec.
-    #     - FPS is clamped to [min_fps, max_fps] for smooth playback.
-    #     When num_frames is provided and less than T, subsample to that many frames.
-    #     When start_marker/goal_marker (each shape (2,) for x,y) are provided, draw red + and green +.
-    #     When gif_out_dir is provided, save there instead of using trainer paths.
-    #     output_format: "gif" or "mp4".
-    #     """
-    #     print("Rendering pushboundary 2d visualization...")
-    #     min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
-    #     if states.ndim != 2 or states.shape[-1] < min_dim:
-    #         return
-    #     tcp_xy = states[:, list(tcp_xy_indices)]
-    #     block_xy = states[:, list(block_xy_indices)]
-
-    #     if block_rot6d_indices is not None:
-    #         idx = block_rot6d_indices
-    #         # Zhou et al. 2018 columns convention:
-    #         # 6D = [col0, col1] = [R00,R10,R20, R01,R11,R21]
-    #         # For yaw θ: idx[0]=cosθ, idx[1]=sinθ → atan2(sinθ, cosθ)
-    #         block_yaws = np.arctan2(states[:, idx[1]], states[:, idx[0]])
-    #     else:
-    #         block_yaws = None
-
-    #     import matplotlib
-
-    #     matplotlib.use("Agg")
-    #     import matplotlib.pyplot as plt
-    #     from matplotlib.lines import Line2D
-    #     from matplotlib.patches import Circle, Polygon, Rectangle
-
-    #     # Geometry: square block matches cube half-edge; circle matches env CIRCLE_RADIUS.
-    #     BLOCK_HALF = 0.025
-    #     CIRCLE_RADIUS = 0.025
-    #     STICK_RADIUS = 0.008
-
-    #     pad = 0.02
-    #     x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
-    #     x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
-    #     y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
-    #     y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
-    #     if start_marker is not None:
-    #         x_min = min(x_min, start_marker[0] - pad)
-    #         x_max = max(x_max, start_marker[0] + pad)
-    #         y_min = min(y_min, start_marker[1] - pad)
-    #         y_max = max(y_max, start_marker[1] + pad)
-    #     if goal_marker is not None:
-    #         x_min = min(x_min, goal_marker[0] - pad)
-    #         x_max = max(x_max, goal_marker[0] + pad)
-    #         y_min = min(y_min, goal_marker[1] - pad)
-    #         y_max = max(y_max, goal_marker[1] + pad)
-
-    #     T = states.shape[0]
-    #     n_include = T  # Always visualize all trajectory frames (no truncation).
-
-    #     # Adaptive FPS: target duration between min_duration_sec and max_gif_duration_sec
-    #     # so short trajs are visible, long trajs stay under max duration.
-    #     if fps is None:
-    #         target_duration = np.clip(T / 24.0, min_duration_sec, max_gif_duration_sec)
-    #         fps = float(np.clip(T / target_duration, min_fps, max_fps))
-
-    #     if num_frames is None or num_frames >= n_include:
-    #         step_indices = list(range(n_include))
-    #     else:
-    #         step_indices = np.linspace(
-    #             0, n_include - 1, num=num_frames, dtype=int
-    #         ).tolist()
-
-    #     frames_img = []
-    #     for s in step_indices:
-    #         end = int(s) + 1
-    #         fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
-    #         tcp_now = tcp_xy[end - 1]
-    #         block_now = block_xy[end - 1]
-    #         ax.add_patch(
-    #             Circle(
-    #                 (tcp_now[0], tcp_now[1]),
-    #                 radius=STICK_RADIUS,
-    #                 facecolor="#e63946",
-    #                 edgecolor="#c1121f",
-    #                 linewidth=1,
-    #                 zorder=3,
-    #             )
-    #         )
-    #         if block_shape == "circle":
-    #             ax.add_patch(
-    #                 Circle(
-    #                     (block_now[0], block_now[1]),
-    #                     radius=CIRCLE_RADIUS,
-    #                     facecolor="#0066ff",
-    #                     edgecolor="#0047ab",
-    #                     linewidth=1,
-    #                     zorder=3,
-    #                 )
-    #             )
-    #         elif block_yaws is not None:
-    #             yaw = block_yaws[end - 1]
-    #             c, s = np.cos(yaw), np.sin(yaw)
-    #             h = BLOCK_HALF
-    #             local = [(-h, -h), (h, -h), (h, h), (-h, h)]
-    #             corners = [
-    #                 (block_now[0] + c * lx - s * ly, block_now[1] + s * lx + c * ly)
-    #                 for lx, ly in local
-    #             ]
-    #             ax.add_patch(
-    #                 Polygon(
-    #                     corners,
-    #                     closed=True,
-    #                     facecolor="#0066ff",
-    #                     edgecolor="#0047ab",
-    #                     linewidth=1,
-    #                     zorder=3,
-    #                 )
-    #             )
-    #         else:
-    #             ax.add_patch(
-    #                 Rectangle(
-    #                     (block_now[0] - BLOCK_HALF, block_now[1] - BLOCK_HALF),
-    #                     width=2 * BLOCK_HALF,
-    #                     height=2 * BLOCK_HALF,
-    #                     facecolor="#0066ff",
-    #                     edgecolor="#0047ab",
-    #                     linewidth=1,
-    #                     zorder=3,
-    #                 )
-    #             )
-    #         if start_marker is not None:
-    #             ax.plot(
-    #                 start_marker[0],
-    #                 start_marker[1],
-    #                 marker="+",
-    #                 color="#e63946",
-    #                 markersize=14,
-    #                 markeredgewidth=2,
-    #                 zorder=4,
-    #             )
-    #         if goal_marker is not None:
-    #             ax.plot(
-    #                 goal_marker[0],
-    #                 goal_marker[1],
-    #                 marker="+",
-    #                 color="#2d6a4f",
-    #                 markersize=14,
-    #                 markeredgewidth=2,
-    #                 zorder=4,
-    #             )
-    #         ax.set_xlim(x_min, x_max)
-    #         ax.set_ylim(y_min, y_max)
-    #         ax.set_aspect("equal")
-    #         block_legend_marker = "o" if block_shape == "circle" else "s"
-    #         legend_elements = [
-    #             Line2D(
-    #                 [0],
-    #                 [0],
-    #                 marker="o",
-    #                 color="w",
-    #                 markerfacecolor="#e63946",
-    #                 markersize=8,
-    #                 label="tcp",
-    #             ),
-    #             Line2D(
-    #                 [0],
-    #                 [0],
-    #                 marker=block_legend_marker,
-    #                 color="w",
-    #                 markerfacecolor="#0066ff",
-    #                 markersize=8,
-    #                 label="block",
-    #             ),
-    #         ]
-    #         if start_marker is not None:
-    #             legend_elements.append(
-    #                 Line2D(
-    #                     [0],
-    #                     [0],
-    #                     marker="+",
-    #                     color="#e63946",
-    #                     markersize=10,
-    #                     label="start",
-    #                 )
-    #             )
-    #         if goal_marker is not None:
-    #             legend_elements.append(
-    #                 Line2D(
-    #                     [0],
-    #                     [0],
-    #                     marker="+",
-    #                     color="#2d6a4f",
-    #                     markersize=10,
-    #                     label="goal",
-    #                 )
-    #             )
-    #         ax.legend(handles=legend_elements, loc="upper right", fontsize=7)
-    #         ax.set_title(f"step {s}", fontsize=8)
-    #         ax.set_xlabel("X", fontsize=7)
-    #         ax.set_ylabel("Y", fontsize=7)
-    #         fig.tight_layout(pad=0.3)
-    #         fig.canvas.draw()
-    #         w, h_px = fig.canvas.get_width_height()
-    #         buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
-    #         img = buf.reshape(h_px, w, 4).copy()
-    #         frames_img.append(img)
-    #         plt.close(fig)
-
-    #     if gif_out_dir is not None:
-    #         out_dir = Path(gif_out_dir)
-    #     else:
-    #         root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
-    #         out_dir = (
-    #             root_dir
-    #             / "visualizations"
-    #             / "pushboundary_2d"
-    #             / namespace
-    #             / f"global_step_{getattr(self, 'global_step', 0):07d}"
-    #         )
-    #     import os as _os
-
-    #     _prev = _os.umask(0)
-    #     try:
-    #         out_dir.mkdir(mode=0o777, parents=True, exist_ok=True)
-    #     finally:
-    #         _os.umask(_prev)
-    #     ext = "mp4" if output_format == "mp4" else "gif"
-    #     out_path = out_dir / f"sample_{sample_idx}.{ext}"
-
-    #     if output_format == "mp4":
-    #         import cv2
-
-    #         h, w = frames_img[0].shape[:2]
-    #         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    #         writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-    #         for img in frames_img:
-    #             bgr = cv2.cvtColor(img[:, :, 1:4], cv2.COLOR_RGB2BGR)
-    #             writer.write(bgr)
-    #         writer.release()
-    #     else:
-    #         duration_ms = int(1000.0 / fps)
-    #         pil_frames = [Image.fromarray(f) for f in frames_img]
-    #         pil_frames[0].save(
-    #             str(out_path),
-    #             save_all=True,
-    #             append_images=pil_frames[1:],
-    #             duration=duration_ms,
-    #             loop=0,
-    #         )
-
-    #     if self.logger is not None:
-    #         try:
-    #             for j in {0, len(frames_img) // 2, len(frames_img) - 1}:
-    #                 if j < len(frames_img):
-    #                     self.log_image(
-    #                         f"training_visualization/{namespace}/sample_{sample_idx}/frame_{j}",
-    #                         Image.fromarray(frames_img[j]),
-    #                     )
-    #         except Exception:
-    #             pass
 
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)

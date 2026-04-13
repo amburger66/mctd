@@ -13,24 +13,12 @@ gamma: 1.0
 # circle_padded_offline.py, episode_len up to 49 is now safe.
 episode_len: 90
 
-# Full 18D state and 9D action — no state_indices / action_indices slicing.
 observation_shape: [6]
 action_dim: 2
 goal_dim: 2
 
 npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_100k_04_11_simple/all_demos_minimal.npz
 
-# Computed from all valid timesteps across 1007 trajectories (50343 steps).
-# Dims 3-8 of observation and dims 2-8 of action are near-constant (gripper z-height
-# and rotation matrix rows never change), so their std is clamped to 1e-8.
-
-# For demos/v8_combined.npz
-# observation_mean: [-0.13931243, -0.00054828462, 0.084972583, 1, 0, 0, 0, 1, 0, -0.12801315, -0.00051449717, 0.025013341, -0.031437412, -0.01981001, -2.1968481e-07, 0.019810006, -0.031437404, 1.4146258e-06]
-# observation_std:  [0.03658776, 0.045003861, 2.7420263e-05, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 0.024678463, 0.026718821, 1.5887594e-05, 0.69396907, 0.71904016, 0.00036976946, 0.71904016, 0.69396907, 0.00015328004]
-# action_mean:      [-0.13943221, -0.00057164463, 0.084972583, 1, 0, 0, 0, 1, 0]
-# action_std:       [0.036652613, 0.044153877, 2.7420263e-05, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8]
-
-# For demos/100k_demos.npz
 observation_mean: [-0.08185689896345139, 0.000984352664090693, -0.0885743573307991, -0.001169560942798853, 0.006018537562340498, 0.00966984685510397]
 observation_std: [0.07251285761594772, 0.04906739667057991, 0.07100524753332138, 0.04877788946032524, 0.7096759080886841, 0.7040066123008728]
 
