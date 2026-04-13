@@ -11,14 +11,14 @@ gamma: 1.0
 # T_max = 50 (NPZ time dim) → n_frames <= 50 → episode_len <= 49.
 # min(valid_lengths) = 43 in this dataset; with the last-frame padding fix in
 # circle_padded_offline.py, episode_len up to 49 is now safe.
-episode_len: 90
+episode_len: 48
 
 # Full 18D state and 9D action — no state_indices / action_indices slicing.
-observation_shape: [6]
-action_dim: 2
+observation_shape: [18]
+action_dim: 9
 goal_dim: 2
 
-npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_100k_04_11_simple/all_demos_minimal.npz
+npz_path: demos/100k_demos.npz
 
 # Computed from all valid timesteps across 1007 trajectories (50343 steps).
 # Dims 3-8 of observation and dims 2-8 of action are near-constant (gripper z-height
@@ -31,11 +31,10 @@ npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_100k_04
 # action_std:       [0.036652613, 0.044153877, 2.7420263e-05, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8, 1e-8]
 
 # For demos/100k_demos.npz
-observation_mean: [-0.08185689896345139, 0.000984352664090693, -0.0885743573307991, -0.001169560942798853, 0.006018537562340498, 0.00966984685510397]
-observation_std: [0.07251285761594772, 0.04906739667057991, 0.07100524753332138, 0.04877788946032524, 0.7096759080886841, 0.7040066123008728]
-
-action_mean:      [-0.08185689896345139, 0.000984352664090693]
-action_std:       [0.07251285761594772, 0.04906739667057991]
+observation_mean: [-0.13851722, -0.00035880714, 0.085000001, 1, 0, 0, 0, 1, 0, -0.12768517, -0.00017038249, 0.02500108, -0.00365068, -0.0041247611, -1.2150666e-05, 0.0041246676, -0.0036510378, -3.8652047e-07]
+observation_std:  [0.036795477, 0.043543836, 1e-08, 1e-08, 1e-08, 1e-08, 1e-08, 1e-08, 1e-08, 0.025489886, 0.025518617, 2.9407431e-05, 0.71218638, 0.70196815, 0.001023488, 0.70196826, 0.71218681, 0.00053228896]
+action_mean:      [-0.13862758, -0.00036884419, 0.085000001, 1, 0, 0, 0, 1, 0]
+action_std:       [0.036923857, 0.042698184, 1e-08, 1e-08, 1e-08, 1e-08, 1e-08, 1e-08, 1e-08]
 
 reward_mean: 0.0
 reward_std: 1.0
