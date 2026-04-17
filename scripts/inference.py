@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,73 @@ import torch
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _MCTD_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_MCTD_ROOT))
+
+# Default indices for the 6D pushblock_offline observation vector:
+#   [tcp_x, tcp_y, block_x, block_y, yaw_a, yaw_b]
+_TCP_XY_IDX = (0, 1)
+_BLOCK_XY_IDX = (2, 3)
+_BLOCK_YAW2_IDX = (4, 5)  # visualization expects (cos, sin) ordering
+
+# 4-value shorthand: (tcp_x, tcp_y, block_x, block_y) → obs dims 0,1,2,3.
+_SHORTHAND_4D_MAP = [0, 1, 2, 3]
+
+# Set from args in main() before load_config() is called.
+_FRAME_STACK: int = 10
+
+BLOCK_HALF = 0.025
+CIRCLE_RADIUS = 0.025
+STICK_RADIUS = 0.008
+
+
+def valid_path(obs: np.ndarray, block_shape: str, tol=0.01) -> bool:
+    # Check that the TCP does not penetrate the block
+    for t in range(obs.shape[0]):
+        tcp_xy = obs[t, list(_TCP_XY_IDX)]
+        block_xy = obs[t, list(_BLOCK_XY_IDX)]
+        block_yaw = obs[t, list(_BLOCK_YAW2_IDX)]
+        if block_shape == "square":
+            tx, ty = tcp_xy
+            bx, by = block_xy
+            c, s = block_yaw
+
+            # Translate TCP into block-centered coordinates.
+            dx = tx - bx
+            dy = ty - by
+
+            # Rotate into the block's local frame using R^T.
+            # World -> local for rotation matrix [[c, -s], [s, c]]
+            local_x = c * dx + s * dy
+            local_y = -s * dx + c * dy
+
+            # Closest point on the axis-aligned square [-block_half, block_half]^2
+            closest_x = max(-BLOCK_HALF, min(local_x, BLOCK_HALF))
+            closest_y = max(-BLOCK_HALF, min(local_y, BLOCK_HALF))
+
+            # Distance from circle center to closest point on square
+            err_x = local_x - closest_x
+            err_y = local_y - closest_y
+            dist_sq = err_x * err_x + err_y * err_y
+            radius_sq = STICK_RADIUS * STICK_RADIUS
+
+            if dist_sq < radius_sq - tol:
+                print(f"TCP penetrated the block at time {t}")
+                return False
+        elif block_shape == "circle":
+            if np.linalg.norm(tcp_xy - block_xy) < CIRCLE_RADIUS + STICK_RADIUS - tol:
+                print(f"TCP penetrated the circle at time {t}")
+                return False
+    return True
+
+
+def goal_reached(obs: np.ndarray, goal: np.ndarray, goal_threshold: float) -> bool:
+    for t in range(obs.shape[0]):
+        if (
+            np.linalg.norm(obs[t, list(_BLOCK_XY_IDX)] - goal[list(_BLOCK_XY_IDX)])
+            < goal_threshold
+        ):
+            print(f"Goal reached at time {t}")
+            return True
+    return False
 
 
 def _mkdir(path: Path) -> None:
@@ -49,17 +117,57 @@ def _mkdir(path: Path) -> None:
         os.umask(prev)
 
 
-# Default indices for the 6D pushblock_offline observation vector:
-#   [tcp_x, tcp_y, block_x, block_y, yaw_a, yaw_b]
-_TCP_XY_IDX = (0, 1)
-_BLOCK_XY_IDX = (2, 3)
-_BLOCK_YAW2_IDX = (4, 5)  # visualization expects (cos, sin) ordering
+def _now_s() -> float:
+    return time.perf_counter()
 
-# 4-value shorthand: (tcp_x, tcp_y, block_x, block_y) → obs dims 0,1,2,3.
-_SHORTHAND_4D_MAP = [0, 1, 2, 3]
 
-# Set from args in main() before load_config() is called.
-_FRAME_STACK: int = 10
+def _cuda_sync_if_needed(device: torch.device) -> None:
+    # For accurate GPU timings, synchronize around timed regions.
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _write_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _summarize_times(records: list[dict]) -> dict:
+    def _stats(vals: list[float]) -> dict:
+        if not vals:
+            return {"count": 0}
+        arr = np.asarray(vals, dtype=np.float64)
+        return {
+            "count": int(arr.size),
+            "mean_sec": float(arr.mean()),
+            "min_sec": float(arr.min()),
+            "max_sec": float(arr.max()),
+        }
+
+    by_mode: dict[str, list[float]] = {}
+    by_mode_and_scale: dict[str, list[float]] = {}
+    for r in records:
+        mode = str(r.get("mode", "unknown"))
+        t = r.get("time_sec")
+        if t is None:
+            continue
+        by_mode.setdefault(mode, []).append(float(t))
+        if mode == "guided" and "guidance_scale" in r:
+            key = f"{mode}/guidance_scale={r['guidance_scale']}"
+            by_mode_and_scale.setdefault(key, []).append(float(t))
+
+    out = {"by_mode": {k: _stats(v) for k, v in sorted(by_mode.items())}}
+    if by_mode_and_scale:
+        out["by_mode_and_guidance_scale"] = {
+            k: _stats(v) for k, v in sorted(by_mode_and_scale.items())
+        }
+    return out
 
 
 def parse_args():
@@ -87,7 +195,7 @@ def parse_args():
     parser.add_argument(
         "--start",
         type=str,
-        default="0.0,0.0,-0.13,0.0",
+        default="-0.07,0.025,-0.135,0.0,-7.4753106e-02,-9.7523493e-01",
         help=(
             "Start observation for guided mode. Either 4 values (tcp_x,tcp_y,block_x,block_y) "
             "as a shorthand — remaining dims filled with obs mean — or the full obs_dim "
@@ -181,16 +289,15 @@ def parse_args():
     parser.add_argument(
         "--mctd_guidance_scales",
         type=str,
-        default=None,
+        default="0,1,2,5,10",
         help="MCTD-only: comma-separated guidance scales for tree actions (e.g. 0,1,2,5,10)",
     )
     parser.add_argument(
         "--warp_threshold",
         type=float,
-        default=0.04,
+        default=0.015,
         help=(
-            "MCTD-only: warp detection threshold in unnormalized obs-space units "
-            "(default: 0.04)."
+            "MCTD-only: warp detection threshold in unnormalized obs-space units (TCP xy and block xy coordinates only)"
         ),
     )
     parser.add_argument(
@@ -198,8 +305,7 @@ def parse_args():
         type=float,
         default=0.05,
         help=(
-            "MCTD-only: goal-achievement threshold in unnormalized obs-space units "
-            "(default: 0.05)."
+            "MCTD-only: goal-achievement threshold in unnormalized obs-space units (block xy coordinates only)"
         ),
     )
     return parser.parse_args()
@@ -289,8 +395,8 @@ def resolve_checkpoint(checkpoint_arg: str) -> Path:
             max_search_num = None
             num_denoising_steps = None
             mctd_guidance_scales = None
-            warp_threshold = 0.04
-            goal_threshold = 0.05
+            warp_threshold = 0.015
+            goal_threshold = 0.03
 
         cfg = load_config(_Args())
         run_path = f"{cfg.wandb.entity}/{cfg.wandb.project}/{checkpoint_arg}"
@@ -305,8 +411,7 @@ def build_algo_and_dataset(args):
     # print(cfg)
     experiment = build_experiment(cfg, logger=None, ckpt_path=None)
     algo = experiment._build_algo()
-    # dataset = experiment._build_dataset("validation")
-    dataset = None  # FIXME
+    dataset = experiment._build_dataset("validation")
     return algo, dataset, cfg
 
 
@@ -360,6 +465,7 @@ def run_unguided(
     obs_mean_t = torch.from_numpy(obs_mean).to(device).float()
     obs_std_t = torch.from_numpy(obs_std).to(device).float()
     model_device = next(algo.parameters()).device
+    times_path = mode_dir / "inference_times.jsonl"
 
     trajectories = []
     sample_idx = 0
@@ -373,22 +479,37 @@ def run_unguided(
         batch = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in batch)
         observations = batch[0][..., : algo.observation_dim].float()
         batch_size = observations.shape[0]
-        start_norm = (observations[:, 0] - obs_mean_t) / obs_std_t
-        goal_norm = start_norm.clone()
-        start_norm = start_norm.to(model_device).contiguous()
-        goal_norm = goal_norm.to(model_device).contiguous()
-
-        with torch.no_grad():
-            plan_hist = algo.plan(start_norm, goal_norm, H)
-        plan_final = plan_hist[-1]
+        start_norm_batch = (observations[:, 0] - obs_mean_t) / obs_std_t
 
         for i in range(batch_size):
             if sample_idx >= num_samples:
                 break
-            pf = plan_final[:, i : i + 1, :]
+            start_i = start_norm_batch[i : i + 1].to(model_device).contiguous()
+            goal_i = start_i.clone()
+            _cuda_sync_if_needed(model_device)
+            t0 = _now_s()
+            with torch.no_grad():
+                plan_hist = algo.plan(start_i, goal_i, H, guidance_scale=0)
+            _cuda_sync_if_needed(model_device)
+            dt = _now_s() - t0
+            _append_jsonl(
+                times_path,
+                {
+                    "mode": "unguided",
+                    "sample_idx": int(sample_idx),
+                    "time_sec": float(dt),
+                    "guidance_scale": 0.0,
+                    "horizon": int(H),
+                    "frame_stack": int(getattr(algo, "frame_stack", -1)),
+                    "obs_dim": int(getattr(algo, "observation_dim", -1)),
+                    "device": str(model_device),
+                },
+            )
+
+            pf = plan_hist[-1][:, 0:1, :]
             plan_unnorm = algo._unnormalize_x(pf)
             obs_unnorm, _, _ = algo.split_bundle(plan_unnorm)
-            start_unnorm = (start_norm[i] * obs_std_t + obs_mean_t).unsqueeze(0)
+            start_unnorm = (start_i[0] * obs_std_t + obs_mean_t).unsqueeze(0)
             start_obs = start_unnorm[:, : algo.observation_dim].unsqueeze(1)
             full_traj = torch.cat(
                 [start_obs, obs_unnorm[:, : algo.observation_dim]],
@@ -449,6 +570,17 @@ def _expand_obs_shorthand(values: list[float], obs_mean: np.ndarray) -> np.ndarr
 
 def _normalize_obs(obs: np.ndarray, mean: np.ndarray, std: np.ndarray) -> torch.Tensor:
     return torch.from_numpy((obs - mean) / std).float()
+
+
+def _unnormalize_obs_tensor(
+    obs_norm: torch.Tensor, obs_mean: np.ndarray, obs_std: np.ndarray
+) -> torch.Tensor:
+    """Unnormalize an observation-only tensor using obs stats."""
+    mean_t = torch.from_numpy(np.asarray(obs_mean, dtype=np.float32)).to(
+        obs_norm.device
+    )
+    std_t = torch.from_numpy(np.asarray(obs_std, dtype=np.float32)).to(obs_norm.device)
+    return obs_norm * std_t + mean_t
 
 
 def _infer_viz_indices(
@@ -534,7 +666,6 @@ def run_mctd(
     device: torch.device,
 ):
     """Run MCTD planning (algo.p_mctd_plan) for each start/goal pair."""
-    assert dataset is not None, "MCTD mode requires a dataset for sampling start/goal."
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
@@ -548,6 +679,9 @@ def run_mctd(
         start_norm = _normalize_obs(start_unnorm, obs_mean, obs_std).to(device)
         goal_norm = _normalize_obs(goal_unnorm, obs_mean, obs_std).to(device)
     else:
+        assert (
+            dataset is not None
+        ), "MCTD mode requires a dataset for sampling start/goal."
         start_norm, goal_norm, start_unnorm, goal_unnorm = (
             _get_start_goal_from_dataset_with_unnorm(
                 dataset, args.num_samples, algo, device
@@ -558,6 +692,7 @@ def run_mctd(
 
     _mkdir(output_dir)
     viz_dir = output_dir / ("gifs" if args.format == "gif" else "videos")
+    times_path = output_dir / "inference_times.jsonl"
 
     tcp_xy_indices, block_xy_indices, block_yaw_indices = _infer_viz_indices(algo)
     if block_yaw_indices is not None and args.yaw_encoding == "sin_cos":
@@ -572,8 +707,10 @@ def run_mctd(
         start_unnorm_i = start_unnorm[i : i + 1]
         goal_unnorm_i = goal_unnorm[i : i + 1]
 
+        _cuda_sync_if_needed(model_device)
+        t0 = _now_s()
         with torch.no_grad():
-            plan_hist = algo.p_mctd_plan(
+            solved, plan_hist = algo.p_mctd_plan(
                 start_i,
                 goal_i,
                 horizon,
@@ -581,21 +718,55 @@ def run_mctd(
                 start_unnorm_i,
                 goal_unnorm_i,
             )
+        _cuda_sync_if_needed(model_device)
+        dt = _now_s() - t0
+        _append_jsonl(
+            times_path,
+            {
+                "mode": "mctd",
+                "sample_idx": int(i),
+                "time_sec": float(dt),
+                "horizon": int(horizon),
+                "frame_stack": int(getattr(algo, "frame_stack", -1)),
+                "obs_dim": int(getattr(algo, "observation_dim", -1)),
+                "device": str(model_device),
+                "max_search_num": args.max_search_num,
+                "num_denoising_steps": args.num_denoising_steps,
+                "mctd_guidance_scales": args.mctd_guidance_scales,
+                "warp_threshold": float(args.warp_threshold),
+                "goal_threshold": float(args.goal_threshold),
+            },
+        )
 
-        # Unnormalize and take final plan
-        plan_hist = algo._unnormalize_x(plan_hist)
-        plan_final = plan_hist[-1]  # (t, 1, bundle_dim)
-        obs_traj, _, _ = algo.split_bundle(plan_final)  # (t, 1, obs_dim)
-        states = obs_traj[:, 0, :].detach().cpu().numpy().astype(np.float32)
+        # p_mctd_plan may return obs-only (normalized) or full bundle. Handle both.
+        # Shapes observed in this codebase:
+        # - (1, t, 1, obs_dim)  (obs-only, normalized)
+        # - (1, t, 1, bundle_dim) (full bundle, normalized)
+        if plan_hist.ndim != 4:
+            raise ValueError(
+                f"Unexpected p_mctd_plan output shape: {tuple(plan_hist.shape)}"
+            )
+        plan_last_dim = int(plan_hist.shape[-1])
+        plan_final = plan_hist[-1]  # (t, 1, C)
+        if plan_last_dim == int(algo.observation_dim):
+            obs_traj_unnorm = _unnormalize_obs_tensor(plan_final, obs_mean, obs_std)
+            states = obs_traj_unnorm[:, 0, :].detach().cpu().numpy().astype(np.float32)
+        else:
+            plan_unnorm = algo._unnormalize_x(plan_final)
+            obs_traj, _, _ = algo.split_bundle(plan_unnorm)
+            states = obs_traj[:, 0, :].detach().cpu().numpy().astype(np.float32)
 
         start_marker = start_unnorm_i[0, list(block_xy_indices)].astype(np.float32)
         goal_marker = goal_unnorm_i[0, list(block_xy_indices)].astype(np.float32)
+
+        valid = valid_path(states, args.block_shape)
 
         out_path = output_dir / f"plan_{i}.npz"
         np.savez(
             out_path,
             states=states.astype(np.float32),
             target_xy=goal_marker.astype(np.float32),
+            solved=np.bool_(solved and valid),
             source="mctd_inference",
             version=np.int32(1),
             mode="mctd",
@@ -668,6 +839,7 @@ def run_guided(
     viz_dir = mode_dir / "gifs" if output_format == "gif" else mode_dir / "videos"
 
     model_device = next(algo.parameters()).device
+    times_path = mode_dir / "inference_times.jsonl"
     trajectories = []
     batch_size = start_norm.shape[0]
     tcp_xy_indices, block_xy_indices, block_yaw_indices = _infer_viz_indices(algo)
@@ -676,10 +848,27 @@ def run_guided(
     for i in range(batch_size):
         start_i = start_norm[i : i + 1].to(model_device).float().contiguous()
         goal_i = goal_norm[i : i + 1].to(model_device).float().contiguous()
+        _cuda_sync_if_needed(model_device)
+        t0 = _now_s()
         with torch.no_grad():
             plan_hist = algo.plan(
                 start_i, goal_i, horizon, guidance_scale=guidance_scale
             )
+        _cuda_sync_if_needed(model_device)
+        dt = _now_s() - t0
+        _append_jsonl(
+            times_path,
+            {
+                "mode": "guided",
+                "sample_idx": int(i),
+                "time_sec": float(dt),
+                "guidance_scale": float(guidance_scale),
+                "horizon": int(horizon),
+                "frame_stack": int(getattr(algo, "frame_stack", -1)),
+                "obs_dim": int(getattr(algo, "observation_dim", -1)),
+                "device": str(model_device),
+            },
+        )
         plan_final = plan_hist[-1]
         plan_unnorm = algo._unnormalize_x(plan_final)
         obs_unnorm, _, _ = algo.split_bundle(plan_unnorm)
@@ -700,10 +889,17 @@ def run_guided(
         ) + torch.from_numpy(obs_mean).to(device)
         start_marker = _block_xy_from_obs_unnorm(start_unnorm[0], algo)
         goal_marker = _block_xy_from_obs_unnorm(goal_unnorm, algo)
+
+        # TODO: add solved flag and check for invalid path
+        valid = valid_path(states_2d, args.block_shape)
+        solved = goal_reached(
+            states_2d, goal_unnorm.detach().cpu().numpy(), args.goal_threshold
+        )
         np.savez(
             mode_dir / f"trajectory_{i}.npz",
             states=states_2d.astype(np.float32),
             target_xy=goal_marker.astype(np.float32),
+            solved=np.bool_(solved and valid),
             source="diffuser_inference",
             version=np.int32(1),
             mode="guided",
@@ -809,6 +1005,21 @@ def main():
             )
     elif args.mode == "mctd":
         run_mctd(algo, dataset, args, output_dir / "mctd", device)
+
+    # Write summary aggregating all timing files written during this run.
+    records: list[dict] = []
+    for p in output_dir.rglob("inference_times.jsonl"):
+        try:
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        except Exception:
+            pass
+    if records:
+        summary = _summarize_times(records)
+        _write_json(output_dir / "inference_times_summary.json", summary)
 
     print(f"Outputs saved to {output_dir}")
 
