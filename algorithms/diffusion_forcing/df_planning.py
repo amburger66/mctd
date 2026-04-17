@@ -1438,17 +1438,26 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plans = self._unnormalize_x(plans)
         obs, _, _ = self.split_bundle(plans)
         obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
+        # print("obs:", obs.shape)
+        # print("starts:", starts.shape)
+        # print("goals:", goals.shape)
+        # print(f"warp_threshold: {self.warp_threshold}")
+        # print(f"goal_threshold: {self.goal_threshold}")
         values = np.zeros(plans.shape[1])
         infos = np.array(["NotReached"] * plans.shape[1])
         achieved_ts = np.array([None] * plans.shape[1])
         for t in range(obs.shape[0]):
             if t == 0:
-                pos_diff = np.linalg.norm(obs[t] - starts, axis=-1)
+                pos_diff = np.linalg.norm(obs[t][:, :4] - starts[:, :4], axis=-1)
             else:
-                pos_diff = np.linalg.norm(obs[t] - obs[t - 1], axis=-1)
+                pos_diff = np.linalg.norm(obs[t][:, :4] - obs[t - 1][:, :4], axis=-1)
+            # print(f"pos_diff: {pos_diff}")
             infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
             values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
-            diff_from_goal = np.linalg.norm(obs[t] - goals, axis=-1)
+
+            # Only use block xy coordinates to compute goal distance
+            diff_from_goal = np.linalg.norm(obs[t][:, 2:4] - goals[:, 2:4], axis=-1)
+            # print(f"diff_from_goal: {diff_from_goal}")
             values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 plans.shape[0] - t
             ) / plans.shape[0]
@@ -1458,6 +1467,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 "Achieved"
             )
+        # import pdb
+
+        # pdb.set_trace()
 
         return values, infos, achieved_ts
 
@@ -1537,7 +1549,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 expandable_node_names = root_node.get_expandable_node_names()
                 # print(f"Expandable node names: {expandable_node_names}")
             selection_start_time = time.time()
-            print("============ Selection Start ============")
+            # print("============ Selection Start ============")
             psn = self.parallel_search_num
             selected_nodes, expanded_node_candidates = [], []
             while psn > 0:
@@ -1617,7 +1629,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             if len(selected_nodes) == 0:
                 print("No more selected nodes")
                 break
-            print("============ Selection End ============")
+            # print("============ Selection End ============")
             selection_end_time = time.time()
             selection_time.append(selection_end_time - selection_start_time)
 
@@ -1631,7 +1643,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 ###############################
                 # Expansion
                 expansion_start_time = time.time()
-                print("============ Expansion Start ============")
+                # print("============ Expansion Start ============")
                 expanded_node_plans = []
                 expanded_node_noise_levels = []
                 expanded_node_guidance_scales = []
@@ -1673,8 +1685,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     noise_level=expanded_node_noise_levels,
                     plan=expanded_node_plans,
                 )
-                print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
-                print("============ Expansion End ============")
+                # print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
+                # print("============ Expansion End ============")
                 expansion_end_time = time.time()
                 expansion_time.append(expansion_end_time - expansion_start_time)
 
@@ -1682,7 +1694,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # Simulation
                 #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
                 simulation_start_time = time.time()
-                print("============ Simulation Start ============")
+                # print("============ Simulation Start ============")
 
                 # Pad the noise levels - Sequential
                 simul_noiselevel_zero_padding_start = time.time()
@@ -1747,9 +1759,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     plan=value_estimation_plans,
                 )
                 simul_value_estimation_end = time.time()
-                print(
-                    f"Value estimation plan hist: {value_estimation_plan_hists.shape}"
-                )
+                # print(
+                #     f"Value estimation plan hist: {value_estimation_plan_hists.shape}"
+                # )
 
                 # check if any plan is good
                 plans = (
@@ -1763,7 +1775,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 )  # (plan_len-1, N)
                 for i in range(diffs.shape[1]):
                     if filtered_expanded_node_plan_hists[i] is None and not np.all(
-                        diffs[:, i] < 0.1
+                        diffs[:, i] < 0.001  # TODO: make this a parameter
                     ):
                         filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
                             :, :, i
@@ -1846,7 +1858,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 simul_node_allocation_end - simul_node_allocation_start
             )
 
-            print("============ Simulation End ============")
+            # print("============ Simulation End ============")
             simulation_end_time = time.time()
             simulation_time.append(simulation_end_time - simulation_start_time)
 
@@ -1855,20 +1867,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             #  When leaf parallelization is True, then the backpropagation is done in partially parallel (the leafs from same parent node are backpropagated at the same time)
             #  When leaf parallelization is False, then the backpropagation is done in fully sequential (only one node is backpropagated at a time)
             backprop_start_time = time.time()
-            print("============ Backpropagation Start ============")
+            # print("============ Backpropagation Start ============")
 
             distinct_selected_nodes = np.unique(selected_nodes)
             for selected_node in distinct_selected_nodes:
                 selected_node.backpropagate()
 
-            print("============ Backpropagation End ============")
+            # print("============ Backpropagation End ============")
             backprop_end_time = time.time()
             backprop_time.append(backprop_end_time - backprop_start_time)
 
             ######################
             # Early Termination
             early_termination_start_time = time.time()
-            print("============ Early Termination Start ============")
+            # print("============ Early Termination Start ============")
 
             plans = torch.stack(
                 [info["plan_history"][-1][-1] for info in expanded_node_infos.values()],
@@ -1883,12 +1895,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 info = infos[i]
                 achieved_t = achieved_ts[i]
                 if info == "Achieved":
+                    print("Achieved!")
                     solved = True
                     terminal_ts = achieved_t
                     solved_plan = plans[:terminal_ts, i]
                     break
 
-            print("============ Early Termination End ============")
+            # print("============ Early Termination End ============")
             early_termination_end_time = time.time()
             early_termination_time.append(
                 early_termination_end_time - early_termination_start_time
@@ -1922,6 +1935,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             ]  # (1, t, 1, c)
         else:
             if len(achieved_plans) != 0:
+                print(f"Achieved plans: {len(achieved_plans)}")
                 max_value = -1
                 max_plan = None
                 for plan, value in achieved_plans:
@@ -1974,4 +1988,4 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             f"validation_time/simul_node_allocation_time",
             np.sum(simul_node_allocation_time),
         )
-        return output_plan
+        return solved, output_plan
