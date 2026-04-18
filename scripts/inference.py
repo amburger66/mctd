@@ -289,7 +289,7 @@ def parse_args():
     parser.add_argument(
         "--mctd_guidance_scales",
         type=str,
-        default="0,1,2,5,10",
+        default="0,0.1,0.5,1",
         help="MCTD-only: comma-separated guidance scales for tree actions (e.g. 0,1,2,5,10)",
     )
     parser.add_argument(
@@ -682,11 +682,29 @@ def run_mctd(
         assert (
             dataset is not None
         ), "MCTD mode requires a dataset for sampling start/goal."
+        
         start_norm, goal_norm, start_unnorm, goal_unnorm = (
             _get_start_goal_from_dataset_with_unnorm(
                 dataset, args.num_samples, algo, device
             )
         )
+        
+        if args.goal is not None:
+            goal_vals = [float(x) for x in args.goal.split(",")]
+            goal_obs = _expand_obs_shorthand(goal_vals, obs_mean)
+            goal_norm_tmp = _normalize_obs(goal_obs[None], obs_mean, obs_std).to(device)
+            goal_norm_tmp = goal_norm_tmp.repeat(args.num_samples, 1)
+        goal_nan = torch.full_like(goal_norm_tmp, float("nan"))
+        goal_nan[:, 2:4] = goal_norm_tmp[:, 2:4]  # block xy for validity checking and visualization, but not guidance
+        goal_norm = goal_nan
+        
+        goal_unnorm_tmp = goal_obs[None].astype(np.float32)
+        goal_unnorm_tmp = np.repeat(goal_unnorm_tmp, args.num_samples, axis=0)
+        goal_unnorm_nan = np.full_like(goal_unnorm_tmp, float("nan"), dtype=np.float32)
+        goal_unnorm_nan[:, 2:4] = goal_unnorm_tmp[:, 2:4]  # block xy for validity checking and visualization, but not guidance
+        goal_unnorm = goal_unnorm_nan
+        
+        
 
     horizon = args.horizon if args.horizon is not None else algo.episode_len
 
@@ -776,7 +794,6 @@ def run_mctd(
             seed=np.int32(args.seed),
         )
         print(f"  Saved plan to {out_path}")
-
         algo._log_or_save_pushboundary_2d_gif(
             namespace="mctd",
             states=states,

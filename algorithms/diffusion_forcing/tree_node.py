@@ -5,7 +5,7 @@ import torch.nn
 
 class TreeNode():
     def __init__(self, name, depth, parent_node, children_node_guidance_scales, plan_history, guidance_scale=None, terminal_depth=None, 
-            value=None, value_estimation_plan=None, virtual_visit_weight=0.0):
+            value=None, value_estimation_plan=None, virtual_visit_weight=0.0, noise_state=None, committed_plan=None):
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
@@ -24,6 +24,8 @@ class TreeNode():
         self.value = value
         self.value_estimation_plan = value_estimation_plan
         self.visit_count = 0
+        self.noise_state = noise_state
+        self.committed_plan = committed_plan
 
     def __lt__(self, other):
         return self.name < other.name

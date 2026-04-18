@@ -1486,6 +1486,50 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 Image.fromarray(img),
             )
 
+    # def calculate_values(self, plans, starts, goals):
+    #     if plans.shape[1] != starts.shape[0]:
+    #         starts = starts.repeat(plans.shape[1], axis=0)
+    #     if plans.shape[1] != goals.shape[0]:
+    #         goals = goals.repeat(plans.shape[1], axis=0)
+
+    #     plans = self._unnormalize_x(plans)
+    #     obs, _, _ = self.split_bundle(plans)
+    #     obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
+    #     # print("obs:", obs.shape)
+    #     # print("starts:", starts.shape)
+    #     # print("goals:", goals.shape)
+    #     # print(f"warp_threshold: {self.warp_threshold}")
+    #     # print(f"goal_threshold: {self.goal_threshold}")
+    #     values = np.zeros(plans.shape[1])
+    #     infos = np.array(["NotReached"] * plans.shape[1])
+    #     achieved_ts = np.array([None] * plans.shape[1])
+    #     for t in range(obs.shape[0]):
+    #         if t == 0:
+    #             pos_diff = np.linalg.norm(obs[t][:, :4] - starts[:, :4], axis=-1)
+    #         else:
+    #             pos_diff = np.linalg.norm(obs[t][:, :4] - obs[t - 1][:, :4], axis=-1)
+    #         # print(f"pos_diff: {pos_diff}")
+    #         infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
+    #         values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
+
+    #         # Only use block xy coordinates to compute goal distance
+    #         diff_from_goal = np.linalg.norm(obs[t][:, 2:4] - goals[:, 2:4], axis=-1)
+    #         # print(f"diff_from_goal: {diff_from_goal}")
+    #         values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
+    #             plans.shape[0] - t
+    #         ) / plans.shape[0]
+    #         achieved_ts[
+    #             (diff_from_goal < self.goal_threshold) * (infos == "NotReached")
+    #         ] = t
+    #         infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
+    #             "Achieved"
+    #         )
+    #     # import pdb
+
+    #     # pdb.set_trace()
+
+    #     return values, infos, achieved_ts
+    
     def calculate_values(self, plans, starts, goals):
         if plans.shape[1] != starts.shape[0]:
             starts = starts.repeat(plans.shape[1], axis=0)
@@ -1495,38 +1539,39 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plans = self._unnormalize_x(plans)
         obs, _, _ = self.split_bundle(plans)
         obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
-        # print("obs:", obs.shape)
-        # print("starts:", starts.shape)
-        # print("goals:", goals.shape)
-        # print(f"warp_threshold: {self.warp_threshold}")
-        # print(f"goal_threshold: {self.goal_threshold}")
+        
         values = np.zeros(plans.shape[1])
         infos = np.array(["NotReached"] * plans.shape[1])
         achieved_ts = np.array([None] * plans.shape[1])
+        
         for t in range(obs.shape[0]):
             if t == 0:
                 pos_diff = np.linalg.norm(obs[t][:, :4] - starts[:, :4], axis=-1)
             else:
                 pos_diff = np.linalg.norm(obs[t][:, :4] - obs[t - 1][:, :4], axis=-1)
-            # print(f"pos_diff: {pos_diff}")
+            
             infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
             values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
 
-            # Only use block xy coordinates to compute goal distance
-            diff_from_goal = np.linalg.norm(obs[t][:, 2:4] - goals[:, 2:4], axis=-1)
-            # print(f"diff_from_goal: {diff_from_goal}")
+            # --- UPDATED GOAL DISTANCE CALCULATION ---
+            # Calculate squared differences (NaNs propagate here)
+            squared_diff_from_goal = (obs[t][:, 2:4] - goals[:, 2:4]) ** 2
+            
+            # Sum ignoring NaNs, then take the square root
+            diff_from_goal = np.sqrt(np.nansum(squared_diff_from_goal, axis=-1))
+            # -----------------------------------------
+
             values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 plans.shape[0] - t
             ) / plans.shape[0]
+            
             achieved_ts[
                 (diff_from_goal < self.goal_threshold) * (infos == "NotReached")
             ] = t
+            
             infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 "Achieved"
             )
-        # import pdb
-
-        # pdb.set_trace()
 
         return values, infos, achieved_ts
 
@@ -1987,7 +2032,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # so it matches the full-bundle channel dim of the plan tensors.
         goal_bundle = self.make_bundle(obs=goal_normalized)  # (1, obs+act)
         if solved:
-            output_plan = torch.cat([solved_plan[:, None], goal_bundle[None]], dim=0)[
+            # Get the final state the agent planned
+            final_planned_state = solved_plan[-1]
+            
+            # Replace NaNs in the goal bundle with the agent's final planned state
+            patched_goal_bundle = torch.where(
+                torch.isnan(goal_bundle), 
+                final_planned_state, 
+                goal_bundle
+            )
+            
+            output_plan = torch.cat([solved_plan[:, None], patched_goal_bundle[None]], dim=0)[
                 None
             ]  # (1, t, 1, c)
         else:
