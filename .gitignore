@@ -168,3 +168,6 @@ checkpoints
 # Pycharm setting
 .idea/
 data/*
+
+# inference results
+inference_block/

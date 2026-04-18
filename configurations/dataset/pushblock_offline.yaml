@@ -13,17 +13,18 @@ gamma: 1.0
 # circle_padded_offline.py, episode_len up to 49 is now safe.
 episode_len: 90
 
-observation_shape: [6]
+# Full 18D state and 9D action — no state_indices / action_indices slicing.
+observation_shape: [14]
 action_dim: 2
 goal_dim: 2
 
-npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_100k_04_11_simple/all_demos_minimal.npz
+npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_200k_04_16_obstacles4/all_demos_4obstacles_no_stationary.npz
 
-observation_mean: [-0.08185689896345139, 0.000984352664090693, -0.0885743573307991, -0.001169560942798853, 0.006018537562340498, 0.00966984685510397]
-observation_std: [0.07251285761594772, 0.04906739667057991, 0.07100524753332138, 0.04877788946032524, 0.7096759080886841, 0.7040066123008728]
+observation_mean: [-0.1297, -0.0002, -0.1297, -0.0002, 0.0096, -0.0065, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002]
+observation_std: [0.0658, 0.0637, 0.0658, 0.0637, 0.7063, 0.7078, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637]
 
-action_mean:      [-0.08185689896345139, 0.000984352664090693]
-action_std:       [0.07251285761594772, 0.04906739667057991]
+action_mean: [-0.1297, -0.0002]
+action_std: [0.0658, 0.0637]
 
 reward_mean: 0.0
 reward_std: 1.0

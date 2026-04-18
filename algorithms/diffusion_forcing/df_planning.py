@@ -117,10 +117,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         *,
         tcp_xy_indices: tuple = (0, 1),
         block_xy_indices: tuple = (2, 3),
-        block_yaw_indices: Optional[tuple] = (
-            4,
-            5,
-        ),  # Updated to expect (cos, sin) indices
+        block_yaw_indices: Optional[tuple] = (4, 5),  # Expect (cos, sin) indices
         num_frames: Optional[int] = None,
         dpi: int = 100,
         fps: Optional[float] = None,
@@ -136,29 +133,37 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
     ) -> None:
         """
         Render a 2D PushBoundary trajectory as a GIF or MP4.
-        Draws robot TCP (circle) and block (rectangle or circle) geometry at each frame.
+        Draws robot TCP (circle), block (rectangle/circle), and any obstacles dynamically.
 
         tcp_xy_indices: which two state dims are gripper x,y (default (0,1)).
         block_xy_indices: which two state dims are block x,y (default (2,3)).
         block_yaw_indices: if provided, a tuple of state dims holding (cos, sin) of the block yaw.
-            When None, the block is drawn axis-aligned.
         """
         print("Rendering pushboundary 2d visualization...")
         min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
         if states.ndim != 2 or states.shape[-1] < min_dim:
             return
+            
         tcp_xy = states[:, list(tcp_xy_indices)]
         block_xy = states[:, list(block_xy_indices)]
 
-        # --- UPDATED YAW LOGIC ---
+        # --- YAW LOGIC ---
         if block_yaw_indices is not None:
             idx = block_yaw_indices
-            # states[:, idx[0]] is cos(yaw), states[:, idx[1]] is sin(yaw)
-            # np.arctan2 takes (y, x) which maps to (sin, cos)
             block_yaws = np.arctan2(states[:, idx[1]], states[:, idx[0]])
         else:
             block_yaws = None
-        # -------------------------
+            
+        # --- DYNAMIC OBSTACLE LOGIC ---
+        # Assuming states are [tcp_x, tcp_y, block_x, block_y, cos, sin, obs1_x, obs1_y...]
+        # Everything from index 6 onwards are obstacle pairs.
+        num_obstacles = (states.shape[-1] - 6) // 2
+        obstacles_xy = []
+        for i in range(num_obstacles):
+            # Obstacles are static, so we only need their positions from the first frame
+            ox = states[0, 6 + 2*i]
+            oy = states[0, 7 + 2*i]
+            obstacles_xy.append((ox, oy))
 
         import matplotlib
 
@@ -168,16 +173,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         from matplotlib.patches import Circle, Polygon, Rectangle
         from PIL import Image
 
-        # Geometry: square block matches cube half-edge; circle matches env CIRCLE_RADIUS.
+        # Geometry
         BLOCK_HALF = 0.025
         CIRCLE_RADIUS = 0.025
         STICK_RADIUS = 0.008
+        OBSTACLE_RADIUS = 0.02
 
         pad = 0.02
         x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
         x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
         y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
         y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
+        
         if start_marker is not None:
             x_min = min(x_min, start_marker[0] - pad)
             x_max = max(x_max, start_marker[0] + pad)
@@ -188,11 +195,17 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             x_max = max(x_max, goal_marker[0] + pad)
             y_min = min(y_min, goal_marker[1] - pad)
             y_max = max(y_max, goal_marker[1] + pad)
+            
+        # --- Expand limits to include obstacles ---
+        for ox, oy in obstacles_xy:
+            x_min = min(x_min, ox - OBSTACLE_RADIUS - pad)
+            x_max = max(x_max, ox + OBSTACLE_RADIUS + pad)
+            y_min = min(y_min, oy - OBSTACLE_RADIUS - pad)
+            y_max = max(y_max, oy + OBSTACLE_RADIUS + pad)
 
         T = states.shape[0]
-        n_include = T  # Always visualize all trajectory frames (no truncation).
+        n_include = T
 
-        # Adaptive FPS: target duration between min_duration_sec and max_gif_duration_sec
         if fps is None:
             target_duration = np.clip(T / 24.0, min_duration_sec, max_gif_duration_sec)
             fps = float(np.clip(T / target_duration, min_fps, max_fps))
@@ -208,6 +221,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         for s in step_indices:
             end = int(s) + 1
             fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
+            
+            # --- Plot static obstacles ---
+            for ox, oy in obstacles_xy:
+                ax.add_patch(
+                    Circle(
+                        (ox, oy),
+                        radius=OBSTACLE_RADIUS,
+                        facecolor="dimgray",
+                        edgecolor="black",
+                        linewidth=1,
+                        alpha=0.8,
+                        zorder=2,
+                    )
+                )
+
             tcp_now = tcp_xy[end - 1]
             block_now = block_xy[end - 1]
             ax.add_patch(
@@ -217,7 +245,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     facecolor="#e63946",
                     edgecolor="#c1121f",
                     linewidth=1,
-                    zorder=3,
+                    zorder=4,
                 )
             )
             if block_shape == "circle":
@@ -237,10 +265,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 h = BLOCK_HALF
                 local = [(-h, -h), (h, -h), (h, h), (-h, h)]
                 corners = [
-                    (
-                        block_now[0] + c * lx - s_val * ly,
-                        block_now[1] + s_val * lx + c * ly,
-                    )
+                    (block_now[0] + c * lx - s_val * ly, block_now[1] + s_val * lx + c * ly)
                     for lx, ly in local
                 ]
                 ax.add_patch(
@@ -273,7 +298,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     color="#e63946",
                     markersize=14,
                     markeredgewidth=2,
-                    zorder=4,
+                    zorder=5,
                 )
             if goal_marker is not None:
                 ax.plot(
@@ -283,11 +308,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     color="#2d6a4f",
                     markersize=14,
                     markeredgewidth=2,
-                    zorder=4,
+                    zorder=5,
                 )
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
             ax.set_aspect("equal")
+            
             block_legend_marker = "o" if block_shape == "circle" else "s"
             legend_elements = [
                 Line2D(
@@ -309,6 +335,21 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     label="block",
                 ),
             ]
+            
+            # --- Add Obstacle to Legend dynamically ---
+            if len(obstacles_xy) > 0:
+                legend_elements.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="w",
+                        markerfacecolor="dimgray",
+                        markersize=8,
+                        label="obstacle",
+                    )
+                )
+
             if start_marker is not None:
                 legend_elements.append(
                     Line2D(
@@ -331,6 +372,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         label="goal",
                     )
                 )
+                
             ax.legend(handles=legend_elements, loc="upper right", fontsize=7)
             ax.set_title(f"step {s}", fontsize=8)
             ax.set_xlabel("X", fontsize=7)
@@ -365,15 +407,25 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         out_path = out_dir / f"sample_{sample_idx}.{ext}"
 
         if output_format == "mp4":
-            import cv2
+            # import cv2
 
-            h, w = frames_img[0].shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-            for img in frames_img:
-                bgr = cv2.cvtColor(img[:, :, 1:4], cv2.COLOR_RGB2BGR)
-                writer.write(bgr)
-            writer.release()
+            # h, w = frames_img[0].shape[:2]
+            # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            # writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+            # for img in frames_img:
+            #     bgr = cv2.cvtColor(img[:, :, 1:4], cv2.COLOR_RGB2BGR)
+            #     writer.write(bgr)
+            # writer.release()
+            out_path_gif = out_path.with_suffix(".gif")
+            duration_ms = int(1000.0 / fps)
+            pil_frames = [Image.fromarray(f) for f in frames_img]
+            pil_frames[0].save(
+                str(out_path_gif),
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=duration_ms,
+                loop=0,
+            )
         else:
             duration_ms = int(1000.0 / fps)
             pil_frames = [Image.fromarray(f) for f in frames_img]
@@ -583,9 +635,14 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             if not self.use_reward:
                 # sparse / no reward setting, guide with goal like diffuser
                 target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
-                dist = nn.functional.mse_loss(
-                    pred, target, reduction="none"
-                )  # (t fs) b c
+
+                # Build a boolean mask outside the autograd graph so no nan_to_num
+                # appears in the gradient path. nan_to_num backward computes
+                # grad_out * isfinite(input), and inf * 0 = nan in IEEE 754.
+                valid_mask = ~torch.isnan(target)  # (t fs) b c, no gradient
+                target_safe = target.detach().nan_to_num(0.0)  # NaN → 0, no gradient
+                dist = (pred - target_safe) ** 2 * valid_mask  # (t fs) b c
+
                 # guidance weight for observation and action
                 weight = np.array(
                     [20]
@@ -608,13 +665,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     dist
                 )  # guidance observation and action with separate weights
                 dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = dist_o[:, :, :2]
-                # dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=self.observation_dim // 2).sqrt()
-                dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1).sqrt()
+                # Sum over all obs dims: NaN goal dims are already zeroed by nan_to_num,
+                # so only non-NaN dims contribute. eps prevents inf gradient from sqrt at 0.
+                dist_o = (dist_o.sum(-1, keepdim=True) + 1e-8).sqrt()
                 dist_o = torch.tanh(
                     dist_o / 2
                 )  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
-                # dist = torch.cat([dist_o, dist_a], -1)
                 dist = dist_o
                 weight = repeat(weight, "t -> t c", c=dist.shape[-1])
                 weight[self.frame_stack :, 1:] = 8
@@ -825,9 +881,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             if not self.use_reward:
                 # sparse / no reward setting, guide with goal like diffuser
                 target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
-                dist = nn.functional.mse_loss(
-                    pred, target, reduction="none"
-                )  # (t fs) b c
+                valid_mask = ~torch.isnan(target)  # no gradient
+                target_safe = target.detach().nan_to_num(0.0)  # no gradient
+                dist = (pred - target_safe) ** 2 * valid_mask  # (t fs) b c
 
                 # guidance weight for observation and action
                 weight = np.array(
@@ -848,8 +904,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     dist
                 )  # guidance observation and action with separate weights
                 dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
-                dist_o = dist_o[:, :, :2]
-                dist_o = reduce(dist_o, "t b (n c) -> t b n", "sum", n=1).sqrt()
+                # Sum over all obs dims: NaN goal dims are already zeroed by nan_to_num,
+                # so only non-NaN dims contribute. eps prevents inf gradient from sqrt at 0.
+                dist_o = (dist_o.sum(-1, keepdim=True) + 1e-8).sqrt()
                 dist_o = torch.tanh(
                     dist_o / 2
                 )  # similar to the "squashed gaussian" in RL, squash to (-1, 1)

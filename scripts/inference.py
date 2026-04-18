@@ -195,7 +195,7 @@ def parse_args():
     parser.add_argument(
         "--start",
         type=str,
-        default="-0.07,0.025,-0.135,0.0,-7.4753106e-02,-9.7523493e-01",
+        default=None,
         help=(
             "Start observation for guided mode. Either 4 values (tcp_x,tcp_y,block_x,block_y) "
             "as a shorthand — remaining dims filled with obs mean — or the full obs_dim "
@@ -600,9 +600,10 @@ def _infer_viz_indices(
         # No yaw channels exist in the 4D representation.
         return (0, 1), (2, 3), None
     if obs_dim == 6:
-        return _TCP_XY_IDX, _BLOCK_XY_IDX, _BLOCK_YAW2_IDX
+        return 
+
     # Fallback: treat unknown layouts as no-yaw for visualization.
-    return (0, 1), (2, 3), None
+    return _TCP_XY_IDX, _BLOCK_XY_IDX, _BLOCK_YAW2_IDX
 
 
 def _block_xy_from_obs_unnorm(obs_unnorm_1d: torch.Tensor, algo) -> np.ndarray:
@@ -671,9 +672,8 @@ def run_mctd(
 
     if args.start is not None and args.goal is not None:
         start_vals = [float(x) for x in args.start.split(",")]
-        goal_vals = [float(x) for x in args.goal.split(",")]
+        goal_obs = [float(x) for x in args.goal.split(",")]
         start_obs = _expand_obs_shorthand(start_vals, obs_mean)[None]
-        goal_obs = _expand_obs_shorthand(goal_vals, obs_mean)[None]
         start_unnorm = np.repeat(start_obs.astype(np.float32), args.num_samples, axis=0)
         goal_unnorm = np.repeat(goal_obs.astype(np.float32), args.num_samples, axis=0)
         start_norm = _normalize_obs(start_unnorm, obs_mean, obs_std).to(device)
@@ -697,6 +697,8 @@ def run_mctd(
     tcp_xy_indices, block_xy_indices, block_yaw_indices = _infer_viz_indices(algo)
     if block_yaw_indices is not None and args.yaw_encoding == "sin_cos":
         block_yaw_indices = (block_yaw_indices[1], block_yaw_indices[0])
+        
+    
 
     model_device = next(algo.parameters()).device
 
@@ -812,18 +814,26 @@ def run_guided(
 
     if args.start is not None and args.goal is not None:
         start_vals = [float(x) for x in args.start.split(",")]
-        goal_vals = [float(x) for x in args.goal.split(",")]
+        goal_obs = [float(x) for x in args.goal.split(",")]
         start_obs = _expand_obs_shorthand(start_vals, obs_mean)
-        goal_obs = _expand_obs_shorthand(goal_vals, obs_mean)
         start_norm = _normalize_obs(start_obs[None], obs_mean, obs_std).to(device)
         goal_norm = _normalize_obs(goal_obs[None], obs_mean, obs_std).to(device)
         start_norm = start_norm.repeat(args.num_samples, 1)
         goal_norm = goal_norm.repeat(args.num_samples, 1)
     else:
         assert dataset is not None
-        start_norm, goal_norm = _get_start_goal_from_dataset(
+        start_norm, goal_norm_tmp = _get_start_goal_from_dataset(
             dataset, args.num_samples, algo, device
         )
+        
+        if args.goal is not None:
+            goal_vals = [float(x) for x in args.goal.split(",")]
+            goal_obs = _expand_obs_shorthand(goal_vals, obs_mean)
+            goal_norm_tmp = _normalize_obs(goal_obs[None], obs_mean, obs_std).to(device)
+            goal_norm_tmp = goal_norm_tmp.repeat(args.num_samples, 1)
+        goal_nan = torch.full_like(goal_norm_tmp, float("nan"))
+        goal_nan[:, 2:4] = goal_norm_tmp[:, 2:4]  # block xy for validity checking and visualization, but not guidance
+        goal_norm = goal_nan
 
     horizon = args.horizon if args.horizon is not None else algo.episode_len
     if guidance_scale is None:
@@ -906,6 +916,7 @@ def run_guided(
             guidance_scale=np.float32(guidance_scale),
             horizon=np.int32(horizon),
         )
+        
         algo._log_or_save_pushboundary_2d_gif(
             namespace="guided",
             states=states_2d,
@@ -945,6 +956,12 @@ def main():
 
     output_dir = Path(args.output_dir)
     _mkdir(output_dir)
+    
+    # sample random start state from the dataset
+    dataset_states = dataset.states
+    start_state = dataset_states[np.random.choice(len(dataset_states))]
+    print(f"Sampled random start state from dataset: {start_state}")
+    
 
     if args.mode == "unguided":
         run_unguided(
