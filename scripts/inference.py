@@ -33,8 +33,11 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _MCTD_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_MCTD_ROOT))
 
+import numpy as np
+from shapely.geometry import Point, Polygon
+
 # Default indices for the 6D pushblock_offline observation vector:
-#   [tcp_x, tcp_y, block_x, block_y, yaw_a, yaw_b]
+#   [tcp_x, tcp_y, block_x, block_y, yaw_a, yaw_b, obs1_x, obs1_y...]
 _TCP_XY_IDX = (0, 1)
 _BLOCK_XY_IDX = (2, 3)
 _BLOCK_YAW2_IDX = (4, 5)  # visualization expects (cos, sin) ordering
@@ -47,46 +50,73 @@ _FRAME_STACK: int = 10
 
 BLOCK_HALF = 0.025
 CIRCLE_RADIUS = 0.025
-STICK_RADIUS = 0.008
+STICK_RADIUS = 0.01
+OBSTACLE_RADIUS = 0.018
 
-
-def valid_path(obs: np.ndarray, block_shape: str, tol=0.01) -> bool:
-    # Check that the TCP does not penetrate the block
+def valid_path(obs: np.ndarray, block_shape: str) -> bool:
+    # Baseline areas for percentage calculations
+    gripper_total_area = np.pi * (STICK_RADIUS ** 2)
+    obstacle_total_area = np.pi * (OBSTACLE_RADIUS ** 2)
+    
     for t in range(obs.shape[0]):
-        tcp_xy = obs[t, list(_TCP_XY_IDX)]
-        block_xy = obs[t, list(_BLOCK_XY_IDX)]
-        block_yaw = obs[t, list(_BLOCK_YAW2_IDX)]
+        # 1. Extract Positions
+        tx, ty = obs[t, list(_TCP_XY_IDX)]
+        bx, by = obs[t, list(_BLOCK_XY_IDX)]
+        
+        # Extract up to 4 obstacles, assuming they start at index 6
+        obstacles_xy = []
+        if obs.shape[1] >= 14:
+            for i in range(6, 14, 2):
+                obstacles_xy.append((obs[t, i], obs[t, i+1]))
+        
+        # 2. Build Shapely Geometries
+        gripper_geom = Point(tx, ty).buffer(STICK_RADIUS)
+        obs_geoms = [Point(ox, oy).buffer(OBSTACLE_RADIUS) for ox, oy in obstacles_xy]
+        
         if block_shape == "square":
-            tx, ty = tcp_xy
-            bx, by = block_xy
-            c, s = block_yaw
-
-            # Translate TCP into block-centered coordinates.
-            dx = tx - bx
-            dy = ty - by
-
-            # Rotate into the block's local frame using R^T.
-            # World -> local for rotation matrix [[c, -s], [s, c]]
-            local_x = c * dx + s * dy
-            local_y = -s * dx + c * dy
-
-            # Closest point on the axis-aligned square [-block_half, block_half]^2
-            closest_x = max(-BLOCK_HALF, min(local_x, BLOCK_HALF))
-            closest_y = max(-BLOCK_HALF, min(local_y, BLOCK_HALF))
-
-            # Distance from circle center to closest point on square
-            err_x = local_x - closest_x
-            err_y = local_y - closest_y
-            dist_sq = err_x * err_x + err_y * err_y
-            radius_sq = STICK_RADIUS * STICK_RADIUS
-
-            if dist_sq < radius_sq - tol:
-                print(f"TCP penetrated the block at time {t}")
-                return False
+            c, s = obs[t, list(_BLOCK_YAW2_IDX)]
+            
+            # Define square corners in local frame [-BLOCK_HALF, BLOCK_HALF]^2
+            corners_local = [
+                (BLOCK_HALF, BLOCK_HALF),
+                (-BLOCK_HALF, BLOCK_HALF),
+                (-BLOCK_HALF, -BLOCK_HALF),
+                (BLOCK_HALF, -BLOCK_HALF)
+            ]
+            
+            # Rotate using rotation matrix [[c, -s], [s, c]] and translate to world frame
+            corners_world = []
+            for lx, ly in corners_local:
+                wx = bx + (c * lx - s * ly)
+                wy = by + (s * lx + c * ly)
+                corners_world.append((wx, wy))
+                
+            block_geom = Polygon(corners_world)
+            
         elif block_shape == "circle":
-            if np.linalg.norm(tcp_xy - block_xy) < CIRCLE_RADIUS + STICK_RADIUS - tol:
-                print(f"TCP penetrated the circle at time {t}")
+            block_geom = Point(bx, by).buffer(CIRCLE_RADIUS)
+        else:
+            raise ValueError(f"Unknown block_shape: {block_shape}")
+
+        # 3. Perform Area Checks
+        
+        # Condition A: > 75% of the gripper is inside the block
+        if gripper_geom.intersection(block_geom).area > (0.75 * gripper_total_area):
+            print(f"TCP penetrated > 75% into the block at time {t}")
+            return False
+            
+        # Condition B: > 75% of the gripper is inside ANY obstacle
+        for idx, obs_geom in enumerate(obs_geoms):
+            if gripper_geom.intersection(obs_geom).area > (0.75 * gripper_total_area):
+                print(f"TCP penetrated > 75% into obstacle {idx+1} at time {t}")
                 return False
+                
+        # Condition C: > 30% of ANY obstacle is covered by the block
+        for idx, obs_geom in enumerate(obs_geoms):
+            if block_geom.intersection(obs_geom).area > (0.30 * obstacle_total_area):
+                print(f"Block covered > 30% of obstacle {idx+1} at time {t}")
+                return False
+
     return True
 
 
@@ -99,6 +129,100 @@ def goal_reached(obs: np.ndarray, goal: np.ndarray, goal_threshold: float) -> bo
             print(f"Goal reached at time {t}")
             return True
     return False
+
+
+def sample_goal_state_batched(states, max_retries=100):
+    """
+    Samples goal states for a batch of environments simultaneously.
+    
+    Args:
+        states: numpy array of shape (B, 14)
+        max_retries: int, maximum number of resampling attempts
+        
+    Returns:
+        goals: numpy array of shape (B, 2) containing the (x, y) coordinates.
+        valid: boolean array of shape (B,) indicating which environments 
+               successfully found a collision-free goal.
+    """
+    B = states.shape[0]
+    
+    # Extract geometries for the entire batch
+    block_pos = states[:, 2:4] # Shape: (B, 2)
+    # Reshape the 8 obstacle coordinates into 4 (x,y) pairs per batch
+    obstacles = states[:, 6:14].reshape(B, 4, 2) # Shape: (B, 4, 2)
+    
+    # Calculate safe distance 
+    safe_dist = (np.sqrt(2) * BLOCK_HALF) + OBSTACLE_RADIUS + 0.002
+    
+    # Initialize output arrays and our completion mask
+    goals = np.zeros((B, 2))
+    valid = np.zeros(B, dtype=bool)
+    
+    for _ in range(max_retries):
+        if np.all(valid):
+            break # Exit early if all batch elements have a valid goal
+            
+        # Extract indices of environments that still need a valid goal
+        active_idx = np.where(~valid)[0]
+        N = len(active_idx)
+        
+        # Subset the data to only compute for active environments
+        act_block_pos = block_pos[active_idx] # (N, 2)
+        act_obstacles = obstacles[active_idx] # (N, 4, 2)
+        
+        # 1. Randomly pick two distinct obstacles per active batch element.
+        # Generating random numbers and sorting them is a highly efficient way 
+        # to sample without replacement across a batch.
+        rand_indices = np.random.rand(N, 4).argsort(axis=1)[:, :2]
+        idx1 = rand_indices[:, 0]
+        idx2 = rand_indices[:, 1]
+        
+        o1 = act_obstacles[np.arange(N), idx1] # (N, 2)
+        o2 = act_obstacles[np.arange(N), idx2] # (N, 2)
+        
+        # 2. Randomized midpoint
+        t = np.random.uniform(0.3, 0.7, size=(N, 1))
+        midpoint = o1 + t * (o2 - o1) # (N, 2)
+        
+        # 3. Normal vectors
+        direction = o2 - o1 # (N, 2)
+        dir_norm = np.linalg.norm(direction, axis=1, keepdims=True)
+        
+        # Prevent division by zero if any obstacles overlap perfectly
+        dir_norm[dir_norm < 1e-5] = 1e-5 
+        
+        normal = np.empty_like(direction)
+        normal[:, 0] = -direction[:, 1]
+        normal[:, 1] = direction[:, 0]
+        normal = normal / dir_norm # (N, 2)
+        
+        # 4. Flip normals pointing towards the block
+        vec_to_block = act_block_pos - midpoint # (N, 2)
+        dot_products = np.sum(normal * vec_to_block, axis=1, keepdims=True) # (N, 1)
+        # np.where conditional array replacement based on dot product
+        normal = np.where(dot_products > 0, -normal, normal)
+        
+        # 5. Random offset
+        max_offset = safe_dist + np.random.uniform(0.02, 0.08, size=(N, 1))
+        offset_dist = np.random.uniform(safe_dist, max_offset, size=(N, 1))
+        
+        proposed_goals = midpoint + (normal * offset_dist) # (N, 2)
+        
+        # 6. Collision Check against ALL 4 obstacles for these N elements
+        # proposed_goals[:, np.newaxis, :] changes shape to (N, 1, 2) 
+        # allowing it to broadcast correctly against act_obstacles (N, 4, 2)
+        dists = np.linalg.norm(act_obstacles - proposed_goals[:, np.newaxis, :], axis=2) # (N, 4)
+        min_dists = np.min(dists, axis=1) # (N,)
+        is_free = min_dists >= safe_dist # (N,)
+        
+        # Map the active indices back to global batch indices and update
+        successful_global_idx = active_idx[is_free]
+        goals[successful_global_idx] = proposed_goals[is_free]
+        valid[successful_global_idx] = True
+        
+    return goals, valid
+    
+    
 
 
 def _mkdir(path: Path) -> None:
@@ -303,7 +427,7 @@ def parse_args():
     parser.add_argument(
         "--goal_threshold",
         type=float,
-        default=0.05,
+        default=0.0175,
         help=(
             "MCTD-only: goal-achievement threshold in unnormalized obs-space units (block xy coordinates only)"
         ),
@@ -689,19 +813,15 @@ def run_mctd(
             )
         )
         
-        if args.goal is not None:
-            goal_vals = [float(x) for x in args.goal.split(",")]
-            goal_obs = _expand_obs_shorthand(goal_vals, obs_mean)
-            goal_norm_tmp = _normalize_obs(goal_obs[None], obs_mean, obs_std).to(device)
-            goal_norm_tmp = goal_norm_tmp.repeat(args.num_samples, 1)
-        goal_nan = torch.full_like(goal_norm_tmp, float("nan"))
-        goal_nan[:, 2:4] = goal_norm_tmp[:, 2:4]  # block xy for validity checking and visualization, but not guidance
+        goal_states = sample_goal_state_batched(start_unnorm, max_retries=100)[0]
+        goal_states_norm = _normalize_obs(goal_states, obs_mean[2:4], obs_std[2:4])
+        
+        goal_nan = torch.full_like(start_norm, float("nan"))
+        goal_nan[:, 2:4] = goal_states_norm  # block xy for validity checking and visualization, but not guidance
         goal_norm = goal_nan
         
-        goal_unnorm_tmp = goal_obs[None].astype(np.float32)
-        goal_unnorm_tmp = np.repeat(goal_unnorm_tmp, args.num_samples, axis=0)
-        goal_unnorm_nan = np.full_like(goal_unnorm_tmp, float("nan"), dtype=np.float32)
-        goal_unnorm_nan[:, 2:4] = goal_unnorm_tmp[:, 2:4]  # block xy for validity checking and visualization, but not guidance
+        goal_unnorm_nan = np.full_like(start_unnorm, float("nan"), dtype=np.float32)
+        goal_unnorm_nan[:, 2:4] = goal_states  # block xy for validity checking and visualization, but not guidance
         goal_unnorm = goal_unnorm_nan
         
         
@@ -781,7 +901,16 @@ def run_mctd(
 
         valid = valid_path(states, args.block_shape)
 
-        out_path = output_dir / f"plan_{i}.npz"
+        if valid and solved:
+            out_path = output_dir / f"plan_{i}_success.npz"
+            suffix = "success"
+        elif not valid and solved:
+            out_path = output_dir / f"plan_{i}_failed_solved.npz"
+            suffix = "failed_solved"
+        else:
+            out_path = output_dir / f"plan_{i}_failed.npz"
+            suffix = "failed"
+
         np.savez(
             out_path,
             states=states.astype(np.float32),
@@ -798,6 +927,7 @@ def run_mctd(
             namespace="mctd",
             states=states,
             sample_idx=i,
+            suffix=suffix,
             tcp_xy_indices=tcp_xy_indices,
             block_xy_indices=block_xy_indices,
             block_yaw_indices=block_yaw_indices,
@@ -838,19 +968,26 @@ def run_guided(
         start_norm = start_norm.repeat(args.num_samples, 1)
         goal_norm = goal_norm.repeat(args.num_samples, 1)
     else:
-        assert dataset is not None
-        start_norm, goal_norm_tmp = _get_start_goal_from_dataset(
-            dataset, args.num_samples, algo, device
+        assert (
+            dataset is not None
+        ), "MCTD mode requires a dataset for sampling start/goal."
+        
+        start_norm, goal_norm, start_unnorm, goal_unnorm = (
+            _get_start_goal_from_dataset_with_unnorm(
+                dataset, args.num_samples, algo, device
+            )
         )
         
-        if args.goal is not None:
-            goal_vals = [float(x) for x in args.goal.split(",")]
-            goal_obs = _expand_obs_shorthand(goal_vals, obs_mean)
-            goal_norm_tmp = _normalize_obs(goal_obs[None], obs_mean, obs_std).to(device)
-            goal_norm_tmp = goal_norm_tmp.repeat(args.num_samples, 1)
-        goal_nan = torch.full_like(goal_norm_tmp, float("nan"))
-        goal_nan[:, 2:4] = goal_norm_tmp[:, 2:4]  # block xy for validity checking and visualization, but not guidance
+        goal_states = sample_goal_state_batched(start_unnorm, max_retries=100)[0]
+        goal_states_norm = _normalize_obs(goal_states, obs_mean[2:4], obs_std[2:4])
+        
+        goal_nan = torch.full_like(start_norm, float("nan"))
+        goal_nan[:, 2:4] = goal_states_norm  # block xy for validity checking and visualization, but not guidance
         goal_norm = goal_nan
+        
+        goal_unnorm_nan = np.full_like(start_unnorm, float("nan"), dtype=np.float32)
+        goal_unnorm_nan[:, 2:4] = goal_states  # block xy for validity checking and visualization, but not guidance
+        goal_unnorm = goal_unnorm_nan
 
     horizon = args.horizon if args.horizon is not None else algo.episode_len
     if guidance_scale is None:
@@ -922,8 +1059,19 @@ def run_guided(
         solved = goal_reached(
             states_2d, goal_unnorm.detach().cpu().numpy(), args.goal_threshold
         )
+        
+        if valid and solved:
+            out_path = mode_dir / f"plan_{i}_success.npz"
+            suffix = "success"
+        elif not valid and solved:
+            out_path = mode_dir / f"plan_{i}_failed_solved.npz"
+            suffix = "failed_solved"
+        else:
+            out_path = mode_dir / f"plan_{i}_failed.npz"
+            suffix = "failed"
+            
         np.savez(
-            mode_dir / f"trajectory_{i}.npz",
+            out_path,
             states=states_2d.astype(np.float32),
             target_xy=goal_marker.astype(np.float32),
             solved=np.bool_(solved and valid),
@@ -938,6 +1086,7 @@ def run_guided(
             namespace="guided",
             states=states_2d,
             sample_idx=i,
+            suffix=suffix,
             tcp_xy_indices=tcp_xy_indices,
             block_xy_indices=block_xy_indices,
             block_yaw_indices=block_yaw_indices,

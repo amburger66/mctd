@@ -114,6 +114,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         namespace: str,
         states: np.ndarray,
         sample_idx: int,
+        suffix: Optional[str] = None,
         *,
         tcp_xy_indices: tuple = (0, 1),
         block_xy_indices: tuple = (2, 3),
@@ -176,8 +177,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         # Geometry
         BLOCK_HALF = 0.025
         CIRCLE_RADIUS = 0.025
-        STICK_RADIUS = 0.008
-        OBSTACLE_RADIUS = 0.02
+        STICK_RADIUS = 0.01
+        OBSTACLE_RADIUS = 0.018
 
         pad = 0.02
         x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
@@ -404,7 +405,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         finally:
             _os.umask(_prev)
         ext = "mp4" if output_format == "mp4" else "gif"
-        out_path = out_dir / f"sample_{sample_idx}.{ext}"
+        out_path = out_dir / f"sample_{sample_idx}_{suffix}.{ext}"
 
         if output_format == "mp4":
             # import cv2
