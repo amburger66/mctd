@@ -14,8 +14,8 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate mctd
 
 
-cd /data/user_data/mbronars/packages/mctd
+cd /data/user_data/mbronars/packages/mctd_updated
 
-CUDA_VISIBLE_DEVICES=0 python main.py +name=my_run
+CUDA_VISIBLE_DEVICES=0 python main.py +name=my_run_long_no_obstacle_dataset
 
 echo "Training completed at $(date)"

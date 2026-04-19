@@ -134,94 +134,105 @@ def goal_reached(obs: np.ndarray, goal: np.ndarray, goal_threshold: float) -> bo
 def sample_goal_state_batched(states, max_retries=100):
     """
     Samples goal states for a batch of environments simultaneously.
+    Handles both 6D states (no obstacles) and 14D states (with obstacles).
     
     Args:
-        states: numpy array of shape (B, 14)
-        max_retries: int, maximum number of resampling attempts
+        states: numpy array of shape (B, 6) or (B, 14)
+        max_retries: int, maximum number of resampling attempts (used for 14D)
         
     Returns:
         goals: numpy array of shape (B, 2) containing the (x, y) coordinates.
         valid: boolean array of shape (B,) indicating which environments 
                successfully found a collision-free goal.
     """
-    B = states.shape[0]
-    
-    # Extract geometries for the entire batch
+    B, state_dim = states.shape
     block_pos = states[:, 2:4] # Shape: (B, 2)
-    # Reshape the 8 obstacle coordinates into 4 (x,y) pairs per batch
-    obstacles = states[:, 6:14].reshape(B, 4, 2) # Shape: (B, 4, 2)
     
-    # Calculate safe distance 
-    safe_dist = (np.sqrt(2) * BLOCK_HALF) + OBSTACLE_RADIUS + 0.002
-    
-    # Initialize output arrays and our completion mask
-    goals = np.zeros((B, 2))
-    valid = np.zeros(B, dtype=bool)
-    
-    for _ in range(max_retries):
-        if np.all(valid):
-            break # Exit early if all batch elements have a valid goal
+    # ---------------------------------------------------------
+    # CASE 1: 6D State (No Obstacles)
+    # ---------------------------------------------------------
+    if state_dim == 6:
+        # Distance is 6x the full block length (2 * BLOCK_HALF)
+        distance = 6.0 * (2.0 * BLOCK_HALF)
+        
+        angles = np.random.uniform(0, 2 * np.pi, size=(B, 1))
+        directions = np.concatenate([np.cos(angles), np.sin(angles)], axis=1)
+        
+        goals = block_pos + (directions * distance)
+        valid = np.ones(B, dtype=bool)
+        
+        return goals, valid
+
+    # ---------------------------------------------------------
+    # CASE 2: 14D State (With Obstacles)
+    # ---------------------------------------------------------
+    elif state_dim == 14:
+        # Reshape the 8 obstacle coordinates into 4 (x,y) pairs per batch
+        obstacles = states[:, 6:14].reshape(B, 4, 2) # Shape: (B, 4, 2)
+        
+        # Calculate safe distance 
+        safe_dist = (np.sqrt(2) * BLOCK_HALF) + OBSTACLE_RADIUS + 0.002
+        
+        # Initialize output arrays
+        goals = np.zeros((B, 2))
+        valid = np.zeros(B, dtype=bool)
+        
+        for _ in range(max_retries):
+            if np.all(valid):
+                break 
+                
+            active_idx = np.where(~valid)[0]
+            N = len(active_idx)
             
-        # Extract indices of environments that still need a valid goal
-        active_idx = np.where(~valid)[0]
-        N = len(active_idx)
-        
-        # Subset the data to only compute for active environments
-        act_block_pos = block_pos[active_idx] # (N, 2)
-        act_obstacles = obstacles[active_idx] # (N, 4, 2)
-        
-        # 1. Randomly pick two distinct obstacles per active batch element.
-        # Generating random numbers and sorting them is a highly efficient way 
-        # to sample without replacement across a batch.
-        rand_indices = np.random.rand(N, 4).argsort(axis=1)[:, :2]
-        idx1 = rand_indices[:, 0]
-        idx2 = rand_indices[:, 1]
-        
-        o1 = act_obstacles[np.arange(N), idx1] # (N, 2)
-        o2 = act_obstacles[np.arange(N), idx2] # (N, 2)
-        
-        # 2. Randomized midpoint
-        t = np.random.uniform(0.3, 0.7, size=(N, 1))
-        midpoint = o1 + t * (o2 - o1) # (N, 2)
-        
-        # 3. Normal vectors
-        direction = o2 - o1 # (N, 2)
-        dir_norm = np.linalg.norm(direction, axis=1, keepdims=True)
-        
-        # Prevent division by zero if any obstacles overlap perfectly
-        dir_norm[dir_norm < 1e-5] = 1e-5 
-        
-        normal = np.empty_like(direction)
-        normal[:, 0] = -direction[:, 1]
-        normal[:, 1] = direction[:, 0]
-        normal = normal / dir_norm # (N, 2)
-        
-        # 4. Flip normals pointing towards the block
-        vec_to_block = act_block_pos - midpoint # (N, 2)
-        dot_products = np.sum(normal * vec_to_block, axis=1, keepdims=True) # (N, 1)
-        # np.where conditional array replacement based on dot product
-        normal = np.where(dot_products > 0, -normal, normal)
-        
-        # 5. Random offset
-        max_offset = safe_dist + np.random.uniform(0.02, 0.08, size=(N, 1))
-        offset_dist = np.random.uniform(safe_dist, max_offset, size=(N, 1))
-        
-        proposed_goals = midpoint + (normal * offset_dist) # (N, 2)
-        
-        # 6. Collision Check against ALL 4 obstacles for these N elements
-        # proposed_goals[:, np.newaxis, :] changes shape to (N, 1, 2) 
-        # allowing it to broadcast correctly against act_obstacles (N, 4, 2)
-        dists = np.linalg.norm(act_obstacles - proposed_goals[:, np.newaxis, :], axis=2) # (N, 4)
-        min_dists = np.min(dists, axis=1) # (N,)
-        is_free = min_dists >= safe_dist # (N,)
-        
-        # Map the active indices back to global batch indices and update
-        successful_global_idx = active_idx[is_free]
-        goals[successful_global_idx] = proposed_goals[is_free]
-        valid[successful_global_idx] = True
-        
-    return goals, valid
+            act_block_pos = block_pos[active_idx] # (N, 2)
+            act_obstacles = obstacles[active_idx] # (N, 4, 2)
+            
+            # 1. Randomly pick two distinct obstacles
+            rand_indices = np.random.rand(N, 4).argsort(axis=1)[:, :2]
+            idx1 = rand_indices[:, 0]
+            idx2 = rand_indices[:, 1]
+            
+            o1 = act_obstacles[np.arange(N), idx1] # (N, 2)
+            o2 = act_obstacles[np.arange(N), idx2] # (N, 2)
+            
+            # 2. Randomized midpoint
+            t = np.random.uniform(0.3, 0.7, size=(N, 1))
+            midpoint = o1 + t * (o2 - o1) # (N, 2)
+            
+            # 3. Normal vectors
+            direction = o2 - o1 # (N, 2)
+            dir_norm = np.linalg.norm(direction, axis=1, keepdims=True)
+            dir_norm[dir_norm < 1e-5] = 1e-5 
+            
+            normal = np.empty_like(direction)
+            normal[:, 0] = -direction[:, 1]
+            normal[:, 1] = direction[:, 0]
+            normal = normal / dir_norm # (N, 2)
+            
+            # 4. Flip normals pointing towards the block
+            vec_to_block = act_block_pos - midpoint # (N, 2)
+            dot_products = np.sum(normal * vec_to_block, axis=1, keepdims=True) # (N, 1)
+            normal = np.where(dot_products > 0, -normal, normal)
+            
+            # 5. Random offset
+            max_offset = safe_dist + np.random.uniform(0.02, 0.08, size=(N, 1))
+            offset_dist = np.random.uniform(safe_dist, max_offset, size=(N, 1))
+            proposed_goals = midpoint + (normal * offset_dist) # (N, 2)
+            
+            # 6. Collision Check against ALL 4 obstacles
+            dists = np.linalg.norm(act_obstacles - proposed_goals[:, np.newaxis, :], axis=2) # (N, 4)
+            min_dists = np.min(dists, axis=1) # (N,)
+            is_free = min_dists >= safe_dist # (N,)
+            
+            # Update valid goals
+            successful_global_idx = active_idx[is_free]
+            goals[successful_global_idx] = proposed_goals[is_free]
+            valid[successful_global_idx] = True
+            
+        return goals, valid
     
+    else:
+        raise ValueError(f"Expected state dimension of 6 or 14, but got {state_dim}")
     
 
 
@@ -1006,7 +1017,7 @@ def run_guided(
     times_path = mode_dir / "inference_times.jsonl"
     trajectories = []
     batch_size = start_norm.shape[0]
-    tcp_xy_indices, block_xy_indices, block_yaw_indices = _infer_viz_indices(algo)
+    tcp_xy_indices, block_xy_indices, block_yaw_indices = _TCP_XY_IDX, _BLOCK_XY_IDX, _BLOCK_YAW2_IDX #_infer_viz_indices(algo)
     if block_yaw_indices is not None and args.yaw_encoding == "sin_cos":
         block_yaw_indices = (block_yaw_indices[1], block_yaw_indices[0])
     for i in range(batch_size):
@@ -1126,7 +1137,6 @@ def main():
     # sample random start state from the dataset
     dataset_states = dataset.states
     start_state = dataset_states[np.random.choice(len(dataset_states))]
-    print(f"Sampled random start state from dataset: {start_state}")
     
 
     if args.mode == "unguided":

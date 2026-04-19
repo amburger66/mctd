@@ -9,8 +9,8 @@ debug: false # global debug flag will be passed into configuration of experiment
 jump: 1 # global jump flag will be passed into configuration of experiment, dataset and algorithm
 
 wandb:
-  group: r-pad-org # wandb group name
-  entity: r-pad # wandb account name / organization name — set to your wandb username [fixme]
+  group: null # wandb group name
+  entity: mbronars # wandb account name / organization name — set to your wandb username [fixme]
   project: mctd # wandb project name; if not provided, defaults to root folder name
   mode: online # set wandb logging to online, offline or dryrun
 

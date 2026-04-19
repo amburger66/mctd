@@ -14,17 +14,26 @@ gamma: 1.0
 episode_len: 90
 
 # Full 18D state and 9D action — no state_indices / action_indices slicing.
-observation_shape: [14]
+# observation_shape: [14]
+observation_shape: [6]
 action_dim: 2
 goal_dim: 2
 
-npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_200k_04_16_obstacles4/all_demos_4obstacles_no_stationary.npz
+# npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_200k_04_16_obstacles4/all_demos_4obstacles_no_stationary.npz
 
-observation_mean: [-0.1297, -0.0002, -0.1297, -0.0002, 0.0096, -0.0065, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002]
-observation_std: [0.0658, 0.0637, 0.0658, 0.0637, 0.7063, 0.7078, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637]
+npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_200k_04_16_obstacles0/all_demos_no_obstacles.npz
 
-action_mean: [-0.1297, -0.0002]
-action_std: [0.0658, 0.0637]
+observation_mean: [-0.1150, -0.0008, -0.1150, -0.0008, -0.0062, -0.0034]
+observation_std: [0.0668, 0.0622, 0.0668, 0.0622, 0.7072, 0.7070]
+
+action_mean: [-0.1150, -0.0008]
+action_std: [0.0668, 0.0622]
+
+# observation_mean: [-0.1297, -0.0002, -0.1297, -0.0002, 0.0096, -0.0065, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002]
+# observation_std: [0.0658, 0.0637, 0.0658, 0.0637, 0.7063, 0.7078, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637]
+
+# action_mean: [-0.1297, -0.0002]
+# action_std: [0.0658, 0.0637]
 
 reward_mean: 0.0
 reward_std: 1.0

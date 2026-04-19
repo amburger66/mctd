@@ -19,7 +19,7 @@ from utils.logging_utils import (
 )
 from .tree_node import TreeNode
 
-from .point_cost_utils import get_point_costs, states_to_pointclouds
+from point_cost_utils import get_point_costs, states_to_pointclouds
 
 OGBENCH_ENVS = [
     "pointmaze-medium-v0",
@@ -629,16 +629,73 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             guidance_scale = self.guidance_scale
 
         def goal_guidance(x):
-            # start (0.015, 0.25), goal (-0.285, -0.25)
-            
+            # x is a tensor of shape [t b (fs c)]
             pred = rearrange(x, "t b (fs c) -> (t fs) b c", fs=self.frame_stack)
             h_padded = (
                 pred.shape[0] - self.frame_stack
             )  # include padding when horizon % frame_stack != 0
-            # rearrange so batch dim is first
-            pred = pred.transpose(0, 1)[..., :6]  # (b, t fs, c)
-            x_pcd = states_to_pointclouds(pred)
-            x_score = get_point_costs(x_pcd)
+
+            if not self.use_reward:
+                # sparse / no reward setting, guide with goal like diffuser
+                target = torch.stack([start] * self.frame_stack + [goal] * (h_padded))
+
+                # Build a boolean mask outside the autograd graph so no nan_to_num
+                # appears in the gradient path. nan_to_num backward computes
+                # grad_out * isfinite(input), and inf * 0 = nan in IEEE 754.
+                valid_mask = ~torch.isnan(target)  # (t fs) b c, no gradient
+                target_safe = target.detach().nan_to_num(0.0)  # NaN → 0, no gradient
+                dist = (pred - target_safe) ** 2 * valid_mask  # (t fs) b c
+
+                # guidance weight for observation and action
+                weight = np.array(
+                    [20]
+                    * (self.frame_stack)  # conditoning (aka reconstruction guidance)
+                    + [
+                        1 for _ in range(horizon)
+                    ]  # try to reach the goal at any horizon
+                    # + [0 for _ in range(horizon-1)] + [1]  # Diffuer guidance
+                    + [0]
+                    * (
+                        h_padded - horizon
+                    )  # don't guide padded entries due to horizon % frame_stack != 0
+                )
+                # mathematically, one may also try multiplying weight by sqrt(alpha_cum)
+                # this means you put higher weight to less noisy terms
+                # which might be better but we haven't tried yet
+                weight = torch.from_numpy(weight).float().to(self.device)
+
+                dist_o, dist_a, _ = self.split_bundle(
+                    dist
+                )  # guidance observation and action with separate weights
+                dist_a = torch.sum(dist_a, -1, keepdim=True).sqrt()
+                # Sum over all obs dims: NaN goal dims are already zeroed by nan_to_num,
+                # so only non-NaN dims contribute. eps prevents inf gradient from sqrt at 0.
+                dist_o = (dist_o.sum(-1, keepdim=True) + 1e-8).sqrt()
+                dist_o = torch.tanh(
+                    dist_o / 2
+                )  # similar to the "squashed gaussian" in RL, squash to (-1, 1)
+                dist = dist_o
+                weight = repeat(weight, "t -> t c", c=dist.shape[-1])
+                weight[self.frame_stack :, 1:] = 8
+                weight[: self.frame_stack, 1:] = 2
+                weight = torch.ones_like(dist) * weight[:, None]
+
+                episode_return = (
+                    -(dist * weight).mean() * 1000 * dist.shape[1] / 16
+                )  # considering the batch size
+            else:
+                # dense reward seeting, guide with reward
+                raise NotImplementedError(
+                    "reward guidance not officially supported yet, although implemented"
+                )
+                rewards = pred[:, :, -1]
+                weight = np.array(
+                    [10] * self.frame_stack
+                    + [0.997**j for j in range(h)]
+                    + [0] * h_padded
+                )
+                weight = torch.from_numpy(weight).float().to(self.device)
+                episode_return = rewards * weight[:, None]
 
             # return self.guidance_scale * episode_return
             return guidance_scale * episode_return
