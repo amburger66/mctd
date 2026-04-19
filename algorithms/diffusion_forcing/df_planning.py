@@ -144,27 +144,52 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
         if states.ndim != 2 or states.shape[-1] < min_dim:
             return
-            
-        tcp_xy = states[:, list(tcp_xy_indices)]
-        block_xy = states[:, list(block_xy_indices)]
+
+        def _ffill_time_1d(col: np.ndarray) -> np.ndarray:
+            """Forward-fill then back-fill NaN/Inf along time; default 0 if all invalid."""
+            x = np.asarray(col, dtype=np.float64).copy().ravel()
+            for i in range(1, len(x)):
+                if not np.isfinite(x[i]):
+                    x[i] = x[i - 1]
+            for i in range(len(x) - 2, -1, -1):
+                if not np.isfinite(x[i]):
+                    x[i] = x[i + 1]
+            if not np.isfinite(x).all():
+                x[~np.isfinite(x)] = 0.0
+            return x
+
+        # Plans (e.g. MCTD) may contain NaN timesteps; matplotlib limits must stay finite.
+        states_viz = np.array(states, dtype=np.float64, copy=True)
+        fix_cols = set(tcp_xy_indices) | set(block_xy_indices)
+        if block_yaw_indices is not None:
+            fix_cols |= set(block_yaw_indices)
+        for c in range(6, states_viz.shape[1]):
+            fix_cols.add(c)
+        for c in sorted(fix_cols):
+            if c < states_viz.shape[1]:
+                states_viz[:, c] = _ffill_time_1d(states_viz[:, c])
+
+        tcp_xy = states_viz[:, list(tcp_xy_indices)]
+        block_xy = states_viz[:, list(block_xy_indices)]
 
         # --- YAW LOGIC ---
         if block_yaw_indices is not None:
             idx = block_yaw_indices
-            block_yaws = np.arctan2(states[:, idx[1]], states[:, idx[0]])
+            block_yaws = np.arctan2(states_viz[:, idx[1]], states_viz[:, idx[0]])
         else:
             block_yaws = None
-            
+
         # --- DYNAMIC OBSTACLE LOGIC ---
         # Assuming states are [tcp_x, tcp_y, block_x, block_y, cos, sin, obs1_x, obs1_y...]
         # Everything from index 6 onwards are obstacle pairs.
-        num_obstacles = (states.shape[-1] - 6) // 2
+        num_obstacles = (states_viz.shape[-1] - 6) // 2
         obstacles_xy = []
         for i in range(num_obstacles):
             # Obstacles are static, so we only need their positions from the first frame
-            ox = states[0, 6 + 2*i]
-            oy = states[0, 7 + 2*i]
-            obstacles_xy.append((ox, oy))
+            ox = float(states_viz[0, 6 + 2 * i])
+            oy = float(states_viz[0, 7 + 2 * i])
+            if np.isfinite(ox) and np.isfinite(oy):
+                obstacles_xy.append((ox, oy))
 
         import matplotlib
 
@@ -185,24 +210,32 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
         y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
         y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
-        
-        if start_marker is not None:
-            x_min = min(x_min, start_marker[0] - pad)
-            x_max = max(x_max, start_marker[0] + pad)
-            y_min = min(y_min, start_marker[1] - pad)
-            y_max = max(y_max, start_marker[1] + pad)
-        if goal_marker is not None:
-            x_min = min(x_min, goal_marker[0] - pad)
-            x_max = max(x_max, goal_marker[0] + pad)
-            y_min = min(y_min, goal_marker[1] - pad)
-            y_max = max(y_max, goal_marker[1] + pad)
-            
+
+        if start_marker is not None and np.all(np.isfinite(start_marker)):
+            x_min = min(x_min, float(start_marker[0]) - pad)
+            x_max = max(x_max, float(start_marker[0]) + pad)
+            y_min = min(y_min, float(start_marker[1]) - pad)
+            y_max = max(y_max, float(start_marker[1]) + pad)
+        if goal_marker is not None and np.all(np.isfinite(goal_marker)):
+            x_min = min(x_min, float(goal_marker[0]) - pad)
+            x_max = max(x_max, float(goal_marker[0]) + pad)
+            y_min = min(y_min, float(goal_marker[1]) - pad)
+            y_max = max(y_max, float(goal_marker[1]) + pad)
+
         # --- Expand limits to include obstacles ---
         for ox, oy in obstacles_xy:
             x_min = min(x_min, ox - OBSTACLE_RADIUS - pad)
             x_max = max(x_max, ox + OBSTACLE_RADIUS + pad)
             y_min = min(y_min, oy - OBSTACLE_RADIUS - pad)
             y_max = max(y_max, oy + OBSTACLE_RADIUS + pad)
+
+        if (
+            not all(np.isfinite(v) for v in (x_min, x_max, y_min, y_max))
+            or x_min >= x_max
+            or y_min >= y_max
+        ):
+            x_min, x_max = -0.35, 0.35
+            y_min, y_max = -0.35, 0.35
 
         T = states.shape[0]
         n_include = T
@@ -222,7 +255,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         for s in step_indices:
             end = int(s) + 1
             fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
-            
+
             # --- Plot static obstacles ---
             for ox, oy in obstacles_xy:
                 ax.add_patch(
@@ -266,7 +299,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 h = BLOCK_HALF
                 local = [(-h, -h), (h, -h), (h, h), (-h, h)]
                 corners = [
-                    (block_now[0] + c * lx - s_val * ly, block_now[1] + s_val * lx + c * ly)
+                    (
+                        block_now[0] + c * lx - s_val * ly,
+                        block_now[1] + s_val * lx + c * ly,
+                    )
                     for lx, ly in local
                 ]
                 ax.add_patch(
@@ -291,20 +327,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         zorder=3,
                     )
                 )
-            if start_marker is not None:
+            if start_marker is not None and np.all(np.isfinite(start_marker)):
                 ax.plot(
-                    start_marker[0],
-                    start_marker[1],
+                    float(start_marker[0]),
+                    float(start_marker[1]),
                     marker="+",
                     color="#e63946",
                     markersize=14,
                     markeredgewidth=2,
                     zorder=5,
                 )
-            if goal_marker is not None:
+            if goal_marker is not None and np.all(np.isfinite(goal_marker)):
                 ax.plot(
-                    goal_marker[0],
-                    goal_marker[1],
+                    float(goal_marker[0]),
+                    float(goal_marker[1]),
                     marker="+",
                     color="#2d6a4f",
                     markersize=14,
@@ -314,7 +350,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
             ax.set_aspect("equal")
-            
+
             block_legend_marker = "o" if block_shape == "circle" else "s"
             legend_elements = [
                 Line2D(
@@ -336,7 +372,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     label="block",
                 ),
             ]
-            
+
             # --- Add Obstacle to Legend dynamically ---
             if len(obstacles_xy) > 0:
                 legend_elements.append(
@@ -351,7 +387,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     )
                 )
 
-            if start_marker is not None:
+            if start_marker is not None and np.all(np.isfinite(start_marker)):
                 legend_elements.append(
                     Line2D(
                         [0],
@@ -362,7 +398,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         label="start",
                     )
                 )
-            if goal_marker is not None:
+            if goal_marker is not None and np.all(np.isfinite(goal_marker)):
                 legend_elements.append(
                     Line2D(
                         [0],
@@ -373,7 +409,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         label="goal",
                     )
                 )
-                
+
             ax.legend(handles=legend_elements, loc="upper right", fontsize=7)
             ax.set_title(f"step {s}", fontsize=8)
             ax.set_xlabel("X", fontsize=7)
@@ -1487,50 +1523,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 Image.fromarray(img),
             )
 
-    # def calculate_values(self, plans, starts, goals):
-    #     if plans.shape[1] != starts.shape[0]:
-    #         starts = starts.repeat(plans.shape[1], axis=0)
-    #     if plans.shape[1] != goals.shape[0]:
-    #         goals = goals.repeat(plans.shape[1], axis=0)
-
-    #     plans = self._unnormalize_x(plans)
-    #     obs, _, _ = self.split_bundle(plans)
-    #     obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
-    #     # print("obs:", obs.shape)
-    #     # print("starts:", starts.shape)
-    #     # print("goals:", goals.shape)
-    #     # print(f"warp_threshold: {self.warp_threshold}")
-    #     # print(f"goal_threshold: {self.goal_threshold}")
-    #     values = np.zeros(plans.shape[1])
-    #     infos = np.array(["NotReached"] * plans.shape[1])
-    #     achieved_ts = np.array([None] * plans.shape[1])
-    #     for t in range(obs.shape[0]):
-    #         if t == 0:
-    #             pos_diff = np.linalg.norm(obs[t][:, :4] - starts[:, :4], axis=-1)
-    #         else:
-    #             pos_diff = np.linalg.norm(obs[t][:, :4] - obs[t - 1][:, :4], axis=-1)
-    #         # print(f"pos_diff: {pos_diff}")
-    #         infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
-    #         values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
-
-    #         # Only use block xy coordinates to compute goal distance
-    #         diff_from_goal = np.linalg.norm(obs[t][:, 2:4] - goals[:, 2:4], axis=-1)
-    #         # print(f"diff_from_goal: {diff_from_goal}")
-    #         values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
-    #             plans.shape[0] - t
-    #         ) / plans.shape[0]
-    #         achieved_ts[
-    #             (diff_from_goal < self.goal_threshold) * (infos == "NotReached")
-    #         ] = t
-    #         infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
-    #             "Achieved"
-    #         )
-    #     # import pdb
-
-    #     # pdb.set_trace()
-
-    #     return values, infos, achieved_ts
-    
     def calculate_values(self, plans, starts, goals):
         if plans.shape[1] != starts.shape[0]:
             starts = starts.repeat(plans.shape[1], axis=0)
@@ -1540,24 +1532,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plans = self._unnormalize_x(plans)
         obs, _, _ = self.split_bundle(plans)
         obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
-        
+
         values = np.zeros(plans.shape[1])
         infos = np.array(["NotReached"] * plans.shape[1])
         achieved_ts = np.array([None] * plans.shape[1])
-        
+
         for t in range(obs.shape[0]):
             if t == 0:
                 pos_diff = np.linalg.norm(obs[t][:, :4] - starts[:, :4], axis=-1)
             else:
                 pos_diff = np.linalg.norm(obs[t][:, :4] - obs[t - 1][:, :4], axis=-1)
-            
+
             infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
             values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
 
             # --- UPDATED GOAL DISTANCE CALCULATION ---
             # Calculate squared differences (NaNs propagate here)
             squared_diff_from_goal = (obs[t][:, 2:4] - goals[:, 2:4]) ** 2
-            
+
             # Sum ignoring NaNs, then take the square root
             diff_from_goal = np.sqrt(np.nansum(squared_diff_from_goal, axis=-1))
             # -----------------------------------------
@@ -1565,11 +1557,11 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 plans.shape[0] - t
             ) / plans.shape[0]
-            
+
             achieved_ts[
                 (diff_from_goal < self.goal_threshold) * (infos == "NotReached")
             ] = t
-            
+
             infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 "Achieved"
             )
@@ -1925,7 +1917,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     not_reached_plans.append(
                         [value_estimation_plan_hists[-1, :, i], values[i]]
                     )
-            print(f"Value Calculation: {values}, {infos}")
+            # print(f"Value Calculation: {values}, {infos}")
             simul_value_calculation_end = time.time()
 
             # Node Allocation
@@ -1992,7 +1984,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             _, infos, achieved_ts = self.calculate_values(
                 plans, start, goal
             )  # (plan_len, N, D), (N, D), (N, D)
-            print(f"Early Termination: {infos}, {achieved_ts}")
+            # print(f"Early Termination: {infos}, {achieved_ts}")
             solved = False
             for i in range(len(infos)):
                 info = infos[i]
@@ -2035,15 +2027,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if solved:
             # Get the final state the agent planned
             final_planned_state = solved_plan[-1]
-            
+
             # Replace NaNs in the goal bundle with the agent's final planned state
             patched_goal_bundle = torch.where(
-                torch.isnan(goal_bundle), 
-                final_planned_state, 
-                goal_bundle
+                torch.isnan(goal_bundle), final_planned_state, goal_bundle
             )
-            
-            output_plan = torch.cat([solved_plan[:, None], patched_goal_bundle[None]], dim=0)[
+
+            output_plan = torch.cat(
+                [solved_plan[:, None], patched_goal_bundle[None]], dim=0
+            )[
                 None
             ]  # (1, t, 1, c)
         else:

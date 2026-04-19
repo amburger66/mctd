@@ -18,7 +18,8 @@ observation_shape: [14]
 action_dim: 2
 goal_dim: 2
 
-npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_200k_04_16_obstacles4/all_demos_4obstacles_no_stationary.npz
+# npz_path: /data/user_data/mbronars/packages/Planning_wrapper/demos/batch_200k_04_16_obstacles4/all_demos_4obstacles_no_stationary.npz
+npz_path: demos/all_demos_4obstacles_no_stationary.npz
 
 observation_mean: [-0.1297, -0.0002, -0.1297, -0.0002, 0.0096, -0.0065, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002, -0.1297, -0.0002]
 observation_std: [0.0658, 0.0637, 0.0658, 0.0637, 0.7063, 0.7078, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637, 0.0658, 0.0637]

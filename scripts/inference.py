@@ -53,64 +53,76 @@ CIRCLE_RADIUS = 0.025
 STICK_RADIUS = 0.01
 OBSTACLE_RADIUS = 0.018
 
+
 def valid_path(obs: np.ndarray, block_shape: str) -> bool:
     # Baseline areas for percentage calculations
-    gripper_total_area = np.pi * (STICK_RADIUS ** 2)
-    obstacle_total_area = np.pi * (OBSTACLE_RADIUS ** 2)
-    
+    gripper_total_area = np.pi * (STICK_RADIUS**2)
+    obstacle_total_area = np.pi * (OBSTACLE_RADIUS**2)
+
     for t in range(obs.shape[0]):
         # 1. Extract Positions
         tx, ty = obs[t, list(_TCP_XY_IDX)]
         bx, by = obs[t, list(_BLOCK_XY_IDX)]
-        
+        if not np.isfinite([tx, ty, bx, by]).all():
+            # Treat non-finite rollouts as invalid instead of crashing shapely.
+            return False
+
         # Extract up to 4 obstacles, assuming they start at index 6
         obstacles_xy = []
         if obs.shape[1] >= 14:
             for i in range(6, 14, 2):
-                obstacles_xy.append((obs[t, i], obs[t, i+1]))
-        
+                ox, oy = obs[t, i], obs[t, i + 1]
+                if not np.isfinite([ox, oy]).all():
+                    return False
+                obstacles_xy.append((ox, oy))
+
         # 2. Build Shapely Geometries
         gripper_geom = Point(tx, ty).buffer(STICK_RADIUS)
         obs_geoms = [Point(ox, oy).buffer(OBSTACLE_RADIUS) for ox, oy in obstacles_xy]
-        
+
         if block_shape == "square":
             c, s = obs[t, list(_BLOCK_YAW2_IDX)]
-            
+            if not np.isfinite([c, s]).all():
+                return False
+
             # Define square corners in local frame [-BLOCK_HALF, BLOCK_HALF]^2
             corners_local = [
                 (BLOCK_HALF, BLOCK_HALF),
                 (-BLOCK_HALF, BLOCK_HALF),
                 (-BLOCK_HALF, -BLOCK_HALF),
-                (BLOCK_HALF, -BLOCK_HALF)
+                (BLOCK_HALF, -BLOCK_HALF),
             ]
-            
+
             # Rotate using rotation matrix [[c, -s], [s, c]] and translate to world frame
             corners_world = []
             for lx, ly in corners_local:
                 wx = bx + (c * lx - s * ly)
                 wy = by + (s * lx + c * ly)
                 corners_world.append((wx, wy))
-                
-            block_geom = Polygon(corners_world)
-            
+
+            try:
+                block_geom = Polygon(corners_world)
+            except Exception:
+                return False
+
         elif block_shape == "circle":
             block_geom = Point(bx, by).buffer(CIRCLE_RADIUS)
         else:
             raise ValueError(f"Unknown block_shape: {block_shape}")
 
         # 3. Perform Area Checks
-        
+
         # Condition A: > 75% of the gripper is inside the block
         if gripper_geom.intersection(block_geom).area > (0.75 * gripper_total_area):
             print(f"TCP penetrated > 75% into the block at time {t}")
             return False
-            
+
         # Condition B: > 75% of the gripper is inside ANY obstacle
         for idx, obs_geom in enumerate(obs_geoms):
             if gripper_geom.intersection(obs_geom).area > (0.75 * gripper_total_area):
                 print(f"TCP penetrated > 75% into obstacle {idx+1} at time {t}")
                 return False
-                
+
         # Condition C: > 30% of ANY obstacle is covered by the block
         for idx, obs_geom in enumerate(obs_geoms):
             if block_geom.intersection(obs_geom).area > (0.30 * obstacle_total_area):
@@ -122,6 +134,8 @@ def valid_path(obs: np.ndarray, block_shape: str) -> bool:
 
 def goal_reached(obs: np.ndarray, goal: np.ndarray, goal_threshold: float) -> bool:
     for t in range(obs.shape[0]):
+        if not np.isfinite(obs[t, list(_BLOCK_XY_IDX)]).all():
+            continue
         if (
             np.linalg.norm(obs[t, list(_BLOCK_XY_IDX)] - goal[list(_BLOCK_XY_IDX)])
             < goal_threshold
@@ -134,95 +148,95 @@ def goal_reached(obs: np.ndarray, goal: np.ndarray, goal_threshold: float) -> bo
 def sample_goal_state_batched(states, max_retries=100):
     """
     Samples goal states for a batch of environments simultaneously.
-    
+
     Args:
         states: numpy array of shape (B, 14)
         max_retries: int, maximum number of resampling attempts
-        
+
     Returns:
         goals: numpy array of shape (B, 2) containing the (x, y) coordinates.
-        valid: boolean array of shape (B,) indicating which environments 
+        valid: boolean array of shape (B,) indicating which environments
                successfully found a collision-free goal.
     """
     B = states.shape[0]
-    
+
     # Extract geometries for the entire batch
-    block_pos = states[:, 2:4] # Shape: (B, 2)
+    block_pos = states[:, 2:4]  # Shape: (B, 2)
     # Reshape the 8 obstacle coordinates into 4 (x,y) pairs per batch
-    obstacles = states[:, 6:14].reshape(B, 4, 2) # Shape: (B, 4, 2)
-    
-    # Calculate safe distance 
+    obstacles = states[:, 6:14].reshape(B, 4, 2)  # Shape: (B, 4, 2)
+
+    # Calculate safe distance
     safe_dist = (np.sqrt(2) * BLOCK_HALF) + OBSTACLE_RADIUS + 0.002
-    
+
     # Initialize output arrays and our completion mask
     goals = np.zeros((B, 2))
     valid = np.zeros(B, dtype=bool)
-    
+
     for _ in range(max_retries):
         if np.all(valid):
-            break # Exit early if all batch elements have a valid goal
-            
+            break  # Exit early if all batch elements have a valid goal
+
         # Extract indices of environments that still need a valid goal
         active_idx = np.where(~valid)[0]
         N = len(active_idx)
-        
+
         # Subset the data to only compute for active environments
-        act_block_pos = block_pos[active_idx] # (N, 2)
-        act_obstacles = obstacles[active_idx] # (N, 4, 2)
-        
+        act_block_pos = block_pos[active_idx]  # (N, 2)
+        act_obstacles = obstacles[active_idx]  # (N, 4, 2)
+
         # 1. Randomly pick two distinct obstacles per active batch element.
-        # Generating random numbers and sorting them is a highly efficient way 
+        # Generating random numbers and sorting them is a highly efficient way
         # to sample without replacement across a batch.
         rand_indices = np.random.rand(N, 4).argsort(axis=1)[:, :2]
         idx1 = rand_indices[:, 0]
         idx2 = rand_indices[:, 1]
-        
-        o1 = act_obstacles[np.arange(N), idx1] # (N, 2)
-        o2 = act_obstacles[np.arange(N), idx2] # (N, 2)
-        
+
+        o1 = act_obstacles[np.arange(N), idx1]  # (N, 2)
+        o2 = act_obstacles[np.arange(N), idx2]  # (N, 2)
+
         # 2. Randomized midpoint
         t = np.random.uniform(0.3, 0.7, size=(N, 1))
-        midpoint = o1 + t * (o2 - o1) # (N, 2)
-        
+        midpoint = o1 + t * (o2 - o1)  # (N, 2)
+
         # 3. Normal vectors
-        direction = o2 - o1 # (N, 2)
+        direction = o2 - o1  # (N, 2)
         dir_norm = np.linalg.norm(direction, axis=1, keepdims=True)
-        
+
         # Prevent division by zero if any obstacles overlap perfectly
-        dir_norm[dir_norm < 1e-5] = 1e-5 
-        
+        dir_norm[dir_norm < 1e-5] = 1e-5
+
         normal = np.empty_like(direction)
         normal[:, 0] = -direction[:, 1]
         normal[:, 1] = direction[:, 0]
-        normal = normal / dir_norm # (N, 2)
-        
+        normal = normal / dir_norm  # (N, 2)
+
         # 4. Flip normals pointing towards the block
-        vec_to_block = act_block_pos - midpoint # (N, 2)
-        dot_products = np.sum(normal * vec_to_block, axis=1, keepdims=True) # (N, 1)
+        vec_to_block = act_block_pos - midpoint  # (N, 2)
+        dot_products = np.sum(normal * vec_to_block, axis=1, keepdims=True)  # (N, 1)
         # np.where conditional array replacement based on dot product
         normal = np.where(dot_products > 0, -normal, normal)
-        
+
         # 5. Random offset
         max_offset = safe_dist + np.random.uniform(0.02, 0.08, size=(N, 1))
         offset_dist = np.random.uniform(safe_dist, max_offset, size=(N, 1))
-        
-        proposed_goals = midpoint + (normal * offset_dist) # (N, 2)
-        
+
+        proposed_goals = midpoint + (normal * offset_dist)  # (N, 2)
+
         # 6. Collision Check against ALL 4 obstacles for these N elements
-        # proposed_goals[:, np.newaxis, :] changes shape to (N, 1, 2) 
+        # proposed_goals[:, np.newaxis, :] changes shape to (N, 1, 2)
         # allowing it to broadcast correctly against act_obstacles (N, 4, 2)
-        dists = np.linalg.norm(act_obstacles - proposed_goals[:, np.newaxis, :], axis=2) # (N, 4)
-        min_dists = np.min(dists, axis=1) # (N,)
-        is_free = min_dists >= safe_dist # (N,)
-        
+        dists = np.linalg.norm(
+            act_obstacles - proposed_goals[:, np.newaxis, :], axis=2
+        )  # (N, 4)
+        min_dists = np.min(dists, axis=1)  # (N,)
+        is_free = min_dists >= safe_dist  # (N,)
+
         # Map the active indices back to global batch indices and update
         successful_global_idx = active_idx[is_free]
         goals[successful_global_idx] = proposed_goals[is_free]
         valid[successful_global_idx] = True
-        
+
     return goals, valid
-    
-    
 
 
 def _mkdir(path: Path) -> None:
@@ -366,15 +380,6 @@ def parse_args():
         type=int,
         default=10,
         help="frame_stack used during training (default: 4)",
-    )
-    parser.add_argument(
-        "--yaw_encoding",
-        choices=["cos_sin", "sin_cos"],
-        default="cos_sin",
-        help=(
-            "How the 2 yaw dims encode yaw; used only for visualization. "
-            "If the rotation direction looks flipped, try --yaw_encoding sin_cos."
-        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -560,7 +565,6 @@ def run_unguided(
     mode_dir: Path | None = None,
     block_shape: str = "square",
     horizon: int | None = None,
-    yaw_encoding: str = "cos_sin",
 ):
     """
     Unguided rollout via ``algo.plan(..., guidance_scale=0)``.
@@ -594,8 +598,6 @@ def run_unguided(
     trajectories = []
     sample_idx = 0
     tcp_xy_indices, block_xy_indices, block_yaw_indices = _infer_viz_indices(algo)
-    if block_yaw_indices is not None and yaw_encoding == "sin_cos":
-        block_yaw_indices = (block_yaw_indices[1], block_yaw_indices[0])
 
     for batch_idx, batch in enumerate(dataloader):
         if sample_idx >= num_samples:
@@ -724,7 +726,7 @@ def _infer_viz_indices(
         # No yaw channels exist in the 4D representation.
         return (0, 1), (2, 3), None
     if obs_dim == 6:
-        return 
+        return
 
     # Fallback: treat unknown layouts as no-yaw for visualization.
     return _TCP_XY_IDX, _BLOCK_XY_IDX, _BLOCK_YAW2_IDX
@@ -806,25 +808,27 @@ def run_mctd(
         assert (
             dataset is not None
         ), "MCTD mode requires a dataset for sampling start/goal."
-        
+
         start_norm, goal_norm, start_unnorm, goal_unnorm = (
             _get_start_goal_from_dataset_with_unnorm(
                 dataset, args.num_samples, algo, device
             )
         )
-        
+
         goal_states = sample_goal_state_batched(start_unnorm, max_retries=100)[0]
         goal_states_norm = _normalize_obs(goal_states, obs_mean[2:4], obs_std[2:4])
-        
+
         goal_nan = torch.full_like(start_norm, float("nan"))
-        goal_nan[:, 2:4] = goal_states_norm  # block xy for validity checking and visualization, but not guidance
+        goal_nan[:, 2:4] = (
+            goal_states_norm  # block xy for validity checking and visualization, but not guidance
+        )
         goal_norm = goal_nan
-        
+
         goal_unnorm_nan = np.full_like(start_unnorm, float("nan"), dtype=np.float32)
-        goal_unnorm_nan[:, 2:4] = goal_states  # block xy for validity checking and visualization, but not guidance
+        goal_unnorm_nan[:, 2:4] = (
+            goal_states  # block xy for validity checking and visualization, but not guidance
+        )
         goal_unnorm = goal_unnorm_nan
-        
-        
 
     horizon = args.horizon if args.horizon is not None else algo.episode_len
 
@@ -833,10 +837,6 @@ def run_mctd(
     times_path = output_dir / "inference_times.jsonl"
 
     tcp_xy_indices, block_xy_indices, block_yaw_indices = _infer_viz_indices(algo)
-    if block_yaw_indices is not None and args.yaw_encoding == "sin_cos":
-        block_yaw_indices = (block_yaw_indices[1], block_yaw_indices[0])
-        
-    
 
     model_device = next(algo.parameters()).device
 
@@ -971,22 +971,26 @@ def run_guided(
         assert (
             dataset is not None
         ), "MCTD mode requires a dataset for sampling start/goal."
-        
+
         start_norm, goal_norm, start_unnorm, goal_unnorm = (
             _get_start_goal_from_dataset_with_unnorm(
                 dataset, args.num_samples, algo, device
             )
         )
-        
+
         goal_states = sample_goal_state_batched(start_unnorm, max_retries=100)[0]
         goal_states_norm = _normalize_obs(goal_states, obs_mean[2:4], obs_std[2:4])
-        
+
         goal_nan = torch.full_like(start_norm, float("nan"))
-        goal_nan[:, 2:4] = goal_states_norm  # block xy for validity checking and visualization, but not guidance
+        goal_nan[:, 2:4] = (
+            goal_states_norm  # block xy for validity checking and visualization, but not guidance
+        )
         goal_norm = goal_nan
-        
+
         goal_unnorm_nan = np.full_like(start_unnorm, float("nan"), dtype=np.float32)
-        goal_unnorm_nan[:, 2:4] = goal_states  # block xy for validity checking and visualization, but not guidance
+        goal_unnorm_nan[:, 2:4] = (
+            goal_states  # block xy for validity checking and visualization, but not guidance
+        )
         goal_unnorm = goal_unnorm_nan
 
     horizon = args.horizon if args.horizon is not None else algo.episode_len
@@ -1007,8 +1011,6 @@ def run_guided(
     trajectories = []
     batch_size = start_norm.shape[0]
     tcp_xy_indices, block_xy_indices, block_yaw_indices = _infer_viz_indices(algo)
-    if block_yaw_indices is not None and args.yaw_encoding == "sin_cos":
-        block_yaw_indices = (block_yaw_indices[1], block_yaw_indices[0])
     for i in range(batch_size):
         start_i = start_norm[i : i + 1].to(model_device).float().contiguous()
         goal_i = goal_norm[i : i + 1].to(model_device).float().contiguous()
@@ -1059,7 +1061,7 @@ def run_guided(
         solved = goal_reached(
             states_2d, goal_unnorm.detach().cpu().numpy(), args.goal_threshold
         )
-        
+
         if valid and solved:
             out_path = mode_dir / f"plan_{i}_success.npz"
             suffix = "success"
@@ -1069,7 +1071,7 @@ def run_guided(
         else:
             out_path = mode_dir / f"plan_{i}_failed.npz"
             suffix = "failed"
-            
+
         np.savez(
             out_path,
             states=states_2d.astype(np.float32),
@@ -1081,7 +1083,7 @@ def run_guided(
             guidance_scale=np.float32(guidance_scale),
             horizon=np.int32(horizon),
         )
-        
+
         algo._log_or_save_pushboundary_2d_gif(
             namespace="guided",
             states=states_2d,
@@ -1122,12 +1124,11 @@ def main():
 
     output_dir = Path(args.output_dir)
     _mkdir(output_dir)
-    
+
     # sample random start state from the dataset
     dataset_states = dataset.states
     start_state = dataset_states[np.random.choice(len(dataset_states))]
     print(f"Sampled random start state from dataset: {start_state}")
-    
 
     if args.mode == "unguided":
         run_unguided(
@@ -1139,7 +1140,6 @@ def main():
             args.format,
             block_shape=args.block_shape,
             horizon=args.horizon,
-            yaw_encoding=args.yaw_encoding,
         )
     elif args.mode == "guided":
         scale_list = _parse_guidance_scales(args.guidance_scales)
