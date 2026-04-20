@@ -1575,6 +1575,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             )
 
         return values, infos, achieved_ts
+    
+    def _decide_commit_length(self, node):
+        # TODO: set from multimodality estimate on node's value_estimation plan
+        return 1
 
     def p_mctd_plan(
         self, obs_normalized, goal_normalized, horizon, conditions, start, goal
@@ -1763,6 +1767,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                             info["depth"] * num_denoising_steps + 1
                         )
                     ]
+                    # c = info["parent_tokens_committed"]   # tokens at noise 0 entering this expansion
+                    # K = info["K"]                         # tokens to drive to 0 this expansion
+                    # _noise_level = noise_level[
+                    #     c * num_denoising_steps
+                    #     : (c + K) * num_denoising_steps + 1
+                    # ]
                     # if info["depth"] == terminal_depth:
                     _noise_level = np.concatenate(
                         [_noise_level]

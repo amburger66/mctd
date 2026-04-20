@@ -29,7 +29,7 @@ warmup_steps: 10000
 # diffusion-related
 guidance_scale: 2.0
 chunk_size: ${dataset.episode_len}
-scheduling_matrix: pyramid
+scheduling_matrix: autoregressive
 interaction_seed: ${experiment.validation.seed}
 use_random_goals_for_interaction: False
 task_id: 1
@@ -38,7 +38,7 @@ val_max_steps: 1000
 mctd: True
 mctd_guidance_scales: [0,0.1,0.5,1,2]
 mctd_max_search_num: 500
-mctd_num_denoising_steps: 20
+mctd_num_denoising_steps: 100
 mctd_skip_level_steps: 10
 time_limit: null
 parallel_search_num: 1
