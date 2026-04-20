@@ -1457,7 +1457,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             print("d:", d)
             if d > threshold:
                 return t
-        return None
+        return x.shape[0] - 1
 
     def make_bundle(
         self,
@@ -1933,31 +1933,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             value_estimation_plan_hists = torch.cat(
                 batch_value_estimation_plan_hists, dim=2
             )
-            # Attempt to visualize the plans
-            start_xy = np.asarray(start[0, :2], dtype=np.float64)
-            goal_xy = np.asarray(goal[0, :2], dtype=np.float64)
-            for i in range(expanded_node_plan_hists.shape[2]):
-                plan_norm = expanded_node_plan_hists[-1, :, i : i + 1, :]
-                plan_phys = self._unnormalize_x(plan_norm)
-                obs_traj, _, _ = self.split_bundle(plan_phys)
-                states = obs_traj[:, 0, :].detach().cpu().numpy()
-                self._log_or_save_pushboundary_2d_gif(
-                    namespace="mctd",
-                    states=states,
-                    sample_idx=i,
-                    start_marker=start_xy,
-                    goal_marker=goal_xy,
-                    block_shape=self._pushboundary_2d_viz_block_shape,
-                    gif_out_dir="viz",
-                )
-                # breakpoint()
             if self.mctd_pairwise_divergence_threshold is not None:
                 t_div = self._first_timestep_mean_pairwise_dist_exceeds(
                     value_estimation_plan_hists[-1],
                     float(self.mctd_pairwise_divergence_threshold),
                 )
                 if t_div is not None:
-                    print("Found deviation:", t_div)
+                    print("Found deviation at timestep:", t_div)
                 self._mctd_pairwise_first_divergence_timesteps.append(t_div)
                 self._mctd_pairwise_first_divergence_timestep = t_div
 
@@ -2020,7 +2002,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
             ######################
             # Backpropagation
-            #  When leaf parallelization is True, then the backpropagation is done in partially parallel (the leafs from same parent node are backpropagated at the same time)
+            #  When leaf parallelization is True, then the backpropagation is done in partially parallesl (the leafs from same parent node are backpropagated at the same time)
             #  When leaf parallelization is False, then the backpropagation is done in fully sequential (only one node is backpropagated at a time)
             backprop_start_time = time.time()
             # print("============ Backpropagation Start ============")

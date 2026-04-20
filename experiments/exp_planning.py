@@ -3,6 +3,9 @@ from datasets import (
     CirclePaddedOfflineRLDataset,
 )
 from algorithms.diffusion_forcing import DiffusionForcingPlanning
+from algorithms.diffusion_forcing.df_planning_fast import (
+    DiffusionForcingPlanning as DiffusionForcingPlanningFast,
+)
 from .exp_base import BaseLightningExperiment
 
 
@@ -13,6 +16,7 @@ class PlanningExperiment(BaseLightningExperiment):
 
     compatible_algorithms = dict(
         df_planning=DiffusionForcingPlanning,
+        df_planning_fast=DiffusionForcingPlanningFast,
     )
 
     compatible_datasets = dict(

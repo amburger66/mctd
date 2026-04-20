@@ -1,4 +1,4 @@
-from typing import Optional, Any
+from typing import Optional, Any, List, Tuple
 from omegaconf import DictConfig
 import time
 import numpy as np
@@ -17,7 +17,7 @@ from utils.logging_utils import (
     make_convergence_animation,
     make_mpc_animation,
 )
-from .tree_node import TreeNode
+from .tree_node_fast import TreeNode
 
 OGBENCH_ENVS = [
     "pointmaze-medium-v0",
@@ -73,12 +73,158 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.parallel_multiple_visits = cfg.parallel_multiple_visits
         self.early_stopping_condition = cfg.early_stopping_condition
         self.num_tries_for_bad_plans = cfg.num_tries_for_bad_plans
+        self.mctd_pairwise_divergence_threshold = cfg.get(
+            "mctd_pairwise_divergence_threshold", None
+        )
         self.sub_goal_interval = cfg.sub_goal_interval
         self.viz_plans = cfg.viz_plans
+        # MCTD batch rollout visualization (single GIF overlay).
+        self.viz_mctd_batch_plans = cfg.get("viz_mctd_batch_plans", False)
+        self.viz_mctd_batch_plans_alpha = float(
+            cfg.get("viz_mctd_batch_plans_alpha", 0.15)
+        )
+        self.viz_mctd_batch_plans_max_branches = cfg.get(
+            "viz_mctd_batch_plans_max_branches", None
+        )
+        self.viz_mctd_batch_plans_every_n_search = int(
+            cfg.get("viz_mctd_batch_plans_every_n_search", 1)
+        )
+        self.viz_mctd_batch_plans_out_dir = Path(
+            cfg.get("viz_mctd_batch_plans_out_dir", "viz")
+        )
         self._pushboundary_2d_viz_block_shape = cfg.get("viz_block_shape", "square")
         self.no_sim_env = cfg.get("no_sim_env", False)
         super().__init__(cfg)
         self.plot_end_points = cfg.plot_start_goal and self.guidance_scale != 0
+
+    def _pushboundary_2d_obstacles_xy(
+        self, states_2d: np.ndarray
+    ) -> List[Tuple[float, float]]:
+        # Assuming states are [tcp_x, tcp_y, block_x, block_y, cos, sin, obs1_x, obs1_y...]
+        # Everything from index 6 onwards are obstacle pairs.
+        num_obstacles = (states_2d.shape[-1] - 6) // 2
+        obstacles_xy: List[Tuple[float, float]] = []
+        for i in range(num_obstacles):
+            ox = float(states_2d[0, 6 + 2 * i])
+            oy = float(states_2d[0, 7 + 2 * i])
+            obstacles_xy.append((ox, oy))
+        return obstacles_xy
+
+    def _pushboundary_2d_limits(
+        self,
+        *,
+        tcp_xy: np.ndarray,
+        block_xy: np.ndarray,
+        obstacles_xy: List[Tuple[float, float]],
+        start_marker: Optional[np.ndarray],
+        goal_marker: Optional[np.ndarray],
+        pad: float,
+        obstacle_radius: float,
+    ) -> Tuple[float, float, float, float]:
+        x_min = float(min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad)
+        x_max = float(max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad)
+        y_min = float(min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad)
+        y_max = float(max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad)
+
+        if start_marker is not None:
+            x_min = min(x_min, float(start_marker[0]) - pad)
+            x_max = max(x_max, float(start_marker[0]) + pad)
+            y_min = min(y_min, float(start_marker[1]) - pad)
+            y_max = max(y_max, float(start_marker[1]) + pad)
+        if goal_marker is not None:
+            x_min = min(x_min, float(goal_marker[0]) - pad)
+            x_max = max(x_max, float(goal_marker[0]) + pad)
+            y_min = min(y_min, float(goal_marker[1]) - pad)
+            y_max = max(y_max, float(goal_marker[1]) + pad)
+
+        for ox, oy in obstacles_xy:
+            x_min = min(x_min, ox - obstacle_radius - pad)
+            x_max = max(x_max, ox + obstacle_radius + pad)
+            y_min = min(y_min, oy - obstacle_radius - pad)
+            y_max = max(y_max, oy + obstacle_radius + pad)
+
+        return x_min, x_max, y_min, y_max
+
+    def _pushboundary_viz_fps(
+        self,
+        *,
+        T: int,
+        fps: Optional[float],
+        min_fps: float,
+        max_fps: float,
+        min_duration_sec: float,
+        max_gif_duration_sec: float,
+    ) -> float:
+        if fps is not None:
+            return float(fps)
+        target_duration = np.clip(T / 24.0, min_duration_sec, max_gif_duration_sec)
+        return float(np.clip(T / target_duration, min_fps, max_fps))
+
+    def _pushboundary_viz_step_indices(
+        self, *, n_include: int, num_frames: Optional[int]
+    ) -> List[int]:
+        if num_frames is None or num_frames >= n_include:
+            return list(range(n_include))
+        return np.linspace(0, n_include - 1, num=num_frames, dtype=int).tolist()
+
+    def _pushboundary_viz_out_dir(
+        self, *, namespace: str, gif_out_dir: Optional[Path]
+    ) -> Path:
+        if gif_out_dir is not None:
+            return Path(gif_out_dir)
+        root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
+        return (
+            root_dir
+            / "visualizations"
+            / "pushboundary_2d"
+            / namespace
+            / f"global_step_{getattr(self, 'global_step', 0):07d}"
+        )
+
+    def _pushboundary_viz_save_frames(
+        self,
+        *,
+        frames_img: List[np.ndarray],
+        out_dir: Path,
+        sample_idx: int,
+        suffix: str,
+        fps: float,
+        output_format: str,
+    ) -> Path:
+        import os as _os
+
+        _prev = _os.umask(0)
+        try:
+            out_dir.mkdir(mode=0o777, parents=True, exist_ok=True)
+        finally:
+            _os.umask(_prev)
+
+        ext = "mp4" if output_format == "mp4" else "gif"
+        out_path = out_dir / f"sample_{sample_idx}_{suffix}.{ext}"
+
+        duration_ms = int(1000.0 / fps)
+        pil_frames = [Image.fromarray(f) for f in frames_img]
+
+        # mp4 path currently falls back to GIF for parity with existing code.
+        if output_format == "mp4":
+            out_path_gif = out_path.with_suffix(".gif")
+            pil_frames[0].save(
+                str(out_path_gif),
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=duration_ms,
+                loop=0,
+            )
+            return out_path_gif
+
+        pil_frames[0].save(
+            str(out_path),
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=duration_ms,
+            loop=0,
+        )
+        return out_path
 
     def _log_or_save_pushboundary_pcd_gif(
         self,
@@ -144,7 +290,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
         if states.ndim != 2 or states.shape[-1] < min_dim:
             return
-            
+
         tcp_xy = states[:, list(tcp_xy_indices)]
         block_xy = states[:, list(block_xy_indices)]
 
@@ -154,17 +300,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             block_yaws = np.arctan2(states[:, idx[1]], states[:, idx[0]])
         else:
             block_yaws = None
-            
-        # --- DYNAMIC OBSTACLE LOGIC ---
-        # Assuming states are [tcp_x, tcp_y, block_x, block_y, cos, sin, obs1_x, obs1_y...]
-        # Everything from index 6 onwards are obstacle pairs.
-        num_obstacles = (states.shape[-1] - 6) // 2
-        obstacles_xy = []
-        for i in range(num_obstacles):
-            # Obstacles are static, so we only need their positions from the first frame
-            ox = states[0, 6 + 2*i]
-            oy = states[0, 7 + 2*i]
-            obstacles_xy.append((ox, oy))
+
+        obstacles_xy = self._pushboundary_2d_obstacles_xy(states)
 
         import matplotlib
 
@@ -181,48 +318,36 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         OBSTACLE_RADIUS = 0.018
 
         pad = 0.02
-        x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
-        x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
-        y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
-        y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
-        
-        if start_marker is not None:
-            x_min = min(x_min, start_marker[0] - pad)
-            x_max = max(x_max, start_marker[0] + pad)
-            y_min = min(y_min, start_marker[1] - pad)
-            y_max = max(y_max, start_marker[1] + pad)
-        if goal_marker is not None:
-            x_min = min(x_min, goal_marker[0] - pad)
-            x_max = max(x_max, goal_marker[0] + pad)
-            y_min = min(y_min, goal_marker[1] - pad)
-            y_max = max(y_max, goal_marker[1] + pad)
-            
-        # --- Expand limits to include obstacles ---
-        for ox, oy in obstacles_xy:
-            x_min = min(x_min, ox - OBSTACLE_RADIUS - pad)
-            x_max = max(x_max, ox + OBSTACLE_RADIUS + pad)
-            y_min = min(y_min, oy - OBSTACLE_RADIUS - pad)
-            y_max = max(y_max, oy + OBSTACLE_RADIUS + pad)
+        x_min, x_max, y_min, y_max = self._pushboundary_2d_limits(
+            tcp_xy=tcp_xy,
+            block_xy=block_xy,
+            obstacles_xy=obstacles_xy,
+            start_marker=start_marker,
+            goal_marker=goal_marker,
+            pad=pad,
+            obstacle_radius=OBSTACLE_RADIUS,
+        )
 
         T = states.shape[0]
         n_include = T
 
-        if fps is None:
-            target_duration = np.clip(T / 24.0, min_duration_sec, max_gif_duration_sec)
-            fps = float(np.clip(T / target_duration, min_fps, max_fps))
-
-        if num_frames is None or num_frames >= n_include:
-            step_indices = list(range(n_include))
-        else:
-            step_indices = np.linspace(
-                0, n_include - 1, num=num_frames, dtype=int
-            ).tolist()
+        fps = self._pushboundary_viz_fps(
+            T=T,
+            fps=fps,
+            min_fps=min_fps,
+            max_fps=max_fps,
+            min_duration_sec=min_duration_sec,
+            max_gif_duration_sec=max_gif_duration_sec,
+        )
+        step_indices = self._pushboundary_viz_step_indices(
+            n_include=n_include, num_frames=num_frames
+        )
 
         frames_img = []
         for s in step_indices:
             end = int(s) + 1
             fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
-            
+
             # --- Plot static obstacles ---
             for ox, oy in obstacles_xy:
                 ax.add_patch(
@@ -266,7 +391,10 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 h = BLOCK_HALF
                 local = [(-h, -h), (h, -h), (h, h), (-h, h)]
                 corners = [
-                    (block_now[0] + c * lx - s_val * ly, block_now[1] + s_val * lx + c * ly)
+                    (
+                        block_now[0] + c * lx - s_val * ly,
+                        block_now[1] + s_val * lx + c * ly,
+                    )
                     for lx, ly in local
                 ]
                 ax.add_patch(
@@ -314,7 +442,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             ax.set_xlim(x_min, x_max)
             ax.set_ylim(y_min, y_max)
             ax.set_aspect("equal")
-            
+
             block_legend_marker = "o" if block_shape == "circle" else "s"
             legend_elements = [
                 Line2D(
@@ -336,7 +464,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     label="block",
                 ),
             ]
-            
+
             # --- Add Obstacle to Legend dynamically ---
             if len(obstacles_xy) > 0:
                 legend_elements.append(
@@ -373,7 +501,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         label="goal",
                     )
                 )
-                
+
             ax.legend(handles=legend_elements, loc="upper right", fontsize=7)
             ax.set_title(f"step {s}", fontsize=8)
             ax.set_xlabel("X", fontsize=7)
@@ -386,57 +514,19 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             frames_img.append(img)
             plt.close(fig)
 
-        if gif_out_dir is not None:
-            out_dir = Path(gif_out_dir)
-        else:
-            root_dir = Path(getattr(self.trainer, "default_root_dir", Path.cwd()))
-            out_dir = (
-                root_dir
-                / "visualizations"
-                / "pushboundary_2d"
-                / namespace
-                / f"global_step_{getattr(self, 'global_step', 0):07d}"
-            )
-        import os as _os
-
-        _prev = _os.umask(0)
-        try:
-            out_dir.mkdir(mode=0o777, parents=True, exist_ok=True)
-        finally:
-            _os.umask(_prev)
-        ext = "mp4" if output_format == "mp4" else "gif"
-        out_path = out_dir / f"sample_{sample_idx}_{suffix}.{ext}"
-
-        if output_format == "mp4":
-            # import cv2
-
-            # h, w = frames_img[0].shape[:2]
-            # fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            # writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-            # for img in frames_img:
-            #     bgr = cv2.cvtColor(img[:, :, 1:4], cv2.COLOR_RGB2BGR)
-            #     writer.write(bgr)
-            # writer.release()
-            out_path_gif = out_path.with_suffix(".gif")
-            duration_ms = int(1000.0 / fps)
-            pil_frames = [Image.fromarray(f) for f in frames_img]
-            pil_frames[0].save(
-                str(out_path_gif),
-                save_all=True,
-                append_images=pil_frames[1:],
-                duration=duration_ms,
-                loop=0,
-            )
-        else:
-            duration_ms = int(1000.0 / fps)
-            pil_frames = [Image.fromarray(f) for f in frames_img]
-            pil_frames[0].save(
-                str(out_path),
-                save_all=True,
-                append_images=pil_frames[1:],
-                duration=duration_ms,
-                loop=0,
-            )
+        out_dir = self._pushboundary_viz_out_dir(
+            namespace=namespace, gif_out_dir=gif_out_dir
+        )
+        if suffix is None:
+            suffix = "trajectory"
+        self._pushboundary_viz_save_frames(
+            frames_img=frames_img,
+            out_dir=out_dir,
+            sample_idx=sample_idx,
+            suffix=suffix,
+            fps=fps,
+            output_format=output_format,
+        )
 
         if self.logger is not None:
             try:
@@ -448,6 +538,299 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         )
             except Exception:
                 pass
+
+    def _log_or_save_pushboundary_2d_batch_gif(
+        self,
+        namespace: str,
+        states: np.ndarray,
+        sample_idx: int,
+        suffix: Optional[str] = None,
+        *,
+        tcp_xy_indices: tuple = (0, 1),
+        block_xy_indices: tuple = (2, 3),
+        block_yaw_indices: Optional[tuple] = (4, 5),  # Expect (cos, sin) indices
+        num_frames: Optional[int] = None,
+        dpi: int = 100,
+        fps: Optional[float] = None,
+        min_fps: float = 10.0,
+        max_fps: float = 60.0,
+        min_duration_sec: float = 4.0,
+        max_gif_duration_sec: float = 20.0,
+        gif_out_dir: Optional[Path] = None,
+        start_marker: Optional[np.ndarray] = None,
+        goal_marker: Optional[np.ndarray] = None,
+        output_format: str = "gif",
+        block_shape: str = "square",
+        alpha: float = 0.15,
+        max_branches: Optional[int] = None,
+        t_div: Optional[int] = None,
+        seed: int = 0,
+    ) -> None:
+        """
+        Render a 2D PushBoundary *batch* of trajectories as one overlaid GIF/MP4.
+
+        `states`: (T, B, D) array in physical units (already unnormalized), where the first
+        dims follow the same layout as `_log_or_save_pushboundary_2d_gif`.
+        """
+        print("Rendering pushboundary 2d batch visualization...")
+        min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
+        if states.ndim != 3 or states.shape[-1] < min_dim:
+            return
+
+        T, B, _ = states.shape
+        if T < 1 or B < 1:
+            return
+
+        # Obstacles are static; infer them from branch 0.
+        obstacles_xy = self._pushboundary_2d_obstacles_xy(states[:, 0, :])
+
+        branch_ids = np.arange(B, dtype=int)
+        if max_branches is not None and B > int(max_branches):
+            rng = np.random.default_rng(int(seed))
+            branch_ids = rng.choice(branch_ids, size=int(max_branches), replace=False)
+            branch_ids = np.sort(branch_ids)
+
+        tcp_xy = states[:, branch_ids][:, :, list(tcp_xy_indices)]  # (T, B', 2)
+        block_xy = states[:, branch_ids][:, :, list(block_xy_indices)]  # (T, B', 2)
+
+        if block_yaw_indices is not None:
+            idx = block_yaw_indices
+            block_yaws = np.arctan2(
+                states[:, branch_ids, idx[1]], states[:, branch_ids, idx[0]]
+            )  # (T, B')
+        else:
+            block_yaws = None
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Circle, Polygon, Rectangle
+
+        # Geometry (match single-trajectory viz).
+        BLOCK_HALF = 0.025
+        CIRCLE_RADIUS = 0.025
+        STICK_RADIUS = 0.01
+        OBSTACLE_RADIUS = 0.018
+
+        pad = 0.02
+        x_min, x_max, y_min, y_max = self._pushboundary_2d_limits(
+            tcp_xy=tcp_xy.reshape(-1, 2),
+            block_xy=block_xy.reshape(-1, 2),
+            obstacles_xy=obstacles_xy,
+            start_marker=start_marker,
+            goal_marker=goal_marker,
+            pad=pad,
+            obstacle_radius=OBSTACLE_RADIUS,
+        )
+
+        fps = self._pushboundary_viz_fps(
+            T=T,
+            fps=fps,
+            min_fps=min_fps,
+            max_fps=max_fps,
+            min_duration_sec=min_duration_sec,
+            max_gif_duration_sec=max_gif_duration_sec,
+        )
+        step_indices = self._pushboundary_viz_step_indices(
+            n_include=T, num_frames=num_frames
+        )
+
+        alpha = float(np.clip(alpha, 0.01, 1.0))
+
+        frames_img: List[np.ndarray] = []
+        for s in step_indices:
+            fig, ax = plt.subplots(figsize=(5, 5), dpi=dpi)
+
+            for ox, oy in obstacles_xy:
+                ax.add_patch(
+                    Circle(
+                        (ox, oy),
+                        radius=OBSTACLE_RADIUS,
+                        facecolor="dimgray",
+                        edgecolor="black",
+                        linewidth=1,
+                        alpha=0.8,
+                        zorder=2,
+                    )
+                )
+
+            for j in range(tcp_xy.shape[1]):
+                tcp_now = tcp_xy[s, j]
+                block_now = block_xy[s, j]
+                ax.add_patch(
+                    Circle(
+                        (tcp_now[0], tcp_now[1]),
+                        radius=STICK_RADIUS,
+                        facecolor="#e63946",
+                        edgecolor="#c1121f",
+                        linewidth=0.8,
+                        alpha=alpha,
+                        zorder=4,
+                    )
+                )
+
+                if block_shape == "circle":
+                    ax.add_patch(
+                        Circle(
+                            (block_now[0], block_now[1]),
+                            radius=CIRCLE_RADIUS,
+                            facecolor="#0066ff",
+                            edgecolor="#0047ab",
+                            linewidth=0.8,
+                            alpha=alpha,
+                            zorder=3,
+                        )
+                    )
+                elif block_yaws is not None:
+                    yaw = float(block_yaws[s, j])
+                    c, s_val = np.cos(yaw), np.sin(yaw)
+                    h = BLOCK_HALF
+                    local = [(-h, -h), (h, -h), (h, h), (-h, h)]
+                    corners = [
+                        (
+                            block_now[0] + c * lx - s_val * ly,
+                            block_now[1] + s_val * lx + c * ly,
+                        )
+                        for lx, ly in local
+                    ]
+                    ax.add_patch(
+                        Polygon(
+                            corners,
+                            closed=True,
+                            facecolor="#0066ff",
+                            edgecolor="#0047ab",
+                            linewidth=0.8,
+                            alpha=alpha,
+                            zorder=3,
+                        )
+                    )
+                else:
+                    ax.add_patch(
+                        Rectangle(
+                            (block_now[0] - BLOCK_HALF, block_now[1] - BLOCK_HALF),
+                            width=2 * BLOCK_HALF,
+                            height=2 * BLOCK_HALF,
+                            facecolor="#0066ff",
+                            edgecolor="#0047ab",
+                            linewidth=0.8,
+                            alpha=alpha,
+                            zorder=3,
+                        )
+                    )
+
+            if start_marker is not None:
+                ax.plot(
+                    start_marker[0],
+                    start_marker[1],
+                    marker="+",
+                    color="#e63946",
+                    markersize=14,
+                    markeredgewidth=2,
+                    zorder=5,
+                )
+            if goal_marker is not None:
+                ax.plot(
+                    goal_marker[0],
+                    goal_marker[1],
+                    marker="+",
+                    color="#2d6a4f",
+                    markersize=14,
+                    markeredgewidth=2,
+                    zorder=5,
+                )
+
+            ax.set_xlim(x_min, x_max)
+            ax.set_ylim(y_min, y_max)
+            ax.set_aspect("equal")
+
+            block_legend_marker = "o" if block_shape == "circle" else "s"
+            legend_elements = [
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor="#e63946",
+                    markersize=8,
+                    label="tcp (overlay)",
+                ),
+                Line2D(
+                    [0],
+                    [0],
+                    marker=block_legend_marker,
+                    color="w",
+                    markerfacecolor="#0066ff",
+                    markersize=8,
+                    label="block (overlay)",
+                ),
+            ]
+
+            if len(obstacles_xy) > 0:
+                legend_elements.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="o",
+                        color="w",
+                        markerfacecolor="dimgray",
+                        markersize=8,
+                        label="obstacle",
+                    )
+                )
+            if start_marker is not None:
+                legend_elements.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="+",
+                        color="#e63946",
+                        markersize=10,
+                        label="start",
+                    )
+                )
+            if goal_marker is not None:
+                legend_elements.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        marker="+",
+                        color="#2d6a4f",
+                        markersize=10,
+                        label="goal",
+                    )
+                )
+            ax.legend(handles=legend_elements, loc="upper right", fontsize=7)
+
+            title = f"step {s} (B={tcp_xy.shape[1]})"
+            if t_div is not None:
+                title += f", t_div={t_div}"
+            ax.set_title(title, fontsize=8)
+            ax.set_xlabel("X", fontsize=7)
+            ax.set_ylabel("Y", fontsize=7)
+
+            fig.tight_layout(pad=0.3)
+            fig.canvas.draw()
+            w, h_px = fig.canvas.get_width_height()
+            buf = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+            img = buf.reshape(h_px, w, 4).copy()
+            frames_img.append(img)
+            plt.close(fig)
+
+        out_dir = self._pushboundary_viz_out_dir(
+            namespace=namespace, gif_out_dir=gif_out_dir
+        )
+        if suffix is None:
+            suffix = "batch_overlay"
+        self._pushboundary_viz_save_frames(
+            frames_img=frames_img,
+            out_dir=out_dir,
+            sample_idx=sample_idx,
+            suffix=suffix,
+            fps=fps,
+            output_format=output_format,
+        )
 
     def _build_model(self):
         mean = list(self.observation_mean) + list(self.action_mean)
@@ -1086,7 +1469,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     **viz_kwargs,
                 )
 
-            # TODO: Execute plan in ManiSkill environment (once hooked up).
+            # FIXME: Execute plan in ManiSkill environment (once hooked up).
             return
 
         try:
@@ -1487,50 +1870,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 Image.fromarray(img),
             )
 
-    # def calculate_values(self, plans, starts, goals):
-    #     if plans.shape[1] != starts.shape[0]:
-    #         starts = starts.repeat(plans.shape[1], axis=0)
-    #     if plans.shape[1] != goals.shape[0]:
-    #         goals = goals.repeat(plans.shape[1], axis=0)
-
-    #     plans = self._unnormalize_x(plans)
-    #     obs, _, _ = self.split_bundle(plans)
-    #     obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
-    #     # print("obs:", obs.shape)
-    #     # print("starts:", starts.shape)
-    #     # print("goals:", goals.shape)
-    #     # print(f"warp_threshold: {self.warp_threshold}")
-    #     # print(f"goal_threshold: {self.goal_threshold}")
-    #     values = np.zeros(plans.shape[1])
-    #     infos = np.array(["NotReached"] * plans.shape[1])
-    #     achieved_ts = np.array([None] * plans.shape[1])
-    #     for t in range(obs.shape[0]):
-    #         if t == 0:
-    #             pos_diff = np.linalg.norm(obs[t][:, :4] - starts[:, :4], axis=-1)
-    #         else:
-    #             pos_diff = np.linalg.norm(obs[t][:, :4] - obs[t - 1][:, :4], axis=-1)
-    #         # print(f"pos_diff: {pos_diff}")
-    #         infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
-    #         values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
-
-    #         # Only use block xy coordinates to compute goal distance
-    #         diff_from_goal = np.linalg.norm(obs[t][:, 2:4] - goals[:, 2:4], axis=-1)
-    #         # print(f"diff_from_goal: {diff_from_goal}")
-    #         values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
-    #             plans.shape[0] - t
-    #         ) / plans.shape[0]
-    #         achieved_ts[
-    #             (diff_from_goal < self.goal_threshold) * (infos == "NotReached")
-    #         ] = t
-    #         infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
-    #             "Achieved"
-    #         )
-    #     # import pdb
-
-    #     # pdb.set_trace()
-
-    #     return values, infos, achieved_ts
-    
     def calculate_values(self, plans, starts, goals):
         if plans.shape[1] != starts.shape[0]:
             starts = starts.repeat(plans.shape[1], axis=0)
@@ -1540,24 +1879,24 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         plans = self._unnormalize_x(plans)
         obs, _, _ = self.split_bundle(plans)
         obs = obs.detach().cpu().numpy()[:-1, :]  # last observation is dummy
-        
+
         values = np.zeros(plans.shape[1])
         infos = np.array(["NotReached"] * plans.shape[1])
         achieved_ts = np.array([None] * plans.shape[1])
-        
+
         for t in range(obs.shape[0]):
             if t == 0:
                 pos_diff = np.linalg.norm(obs[t][:, :4] - starts[:, :4], axis=-1)
             else:
                 pos_diff = np.linalg.norm(obs[t][:, :4] - obs[t - 1][:, :4], axis=-1)
-            
+
             infos[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = "Warp"
             values[(pos_diff > self.warp_threshold) * (infos == "NotReached")] = 0
 
             # --- UPDATED GOAL DISTANCE CALCULATION ---
             # Calculate squared differences (NaNs propagate here)
             squared_diff_from_goal = (obs[t][:, 2:4] - goals[:, 2:4]) ** 2
-            
+
             # Sum ignoring NaNs, then take the square root
             diff_from_goal = np.sqrt(np.nansum(squared_diff_from_goal, axis=-1))
             # -----------------------------------------
@@ -1565,36 +1904,65 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             values[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 plans.shape[0] - t
             ) / plans.shape[0]
-            
+
             achieved_ts[
                 (diff_from_goal < self.goal_threshold) * (infos == "NotReached")
             ] = t
-            
+
             infos[(diff_from_goal < self.goal_threshold) * (infos == "NotReached")] = (
                 "Achieved"
             )
 
         return values, infos, achieved_ts
-    
-    def _decide_commit_length(self, node):
-        # TODO: set from multimodality estimate on node's value_estimation plan
-        return 1
-    
-    
-    def _decide_children_stable_prefix(self, node):
+
+    def _first_timestep_deviation_exceeds(
+        self,
+        plan_last: torch.Tensor,
+        threshold: float,
+        *,
+        obs_only: bool = True,
+    ) -> Optional[int]:
+        """
+        plan_last: (horizon, B, C) normalized bundle, same as value_estimation_plan_hists[-1].
+
+        Returns the first horizon index t (after dropping the final dummy step, matching
+        calculate_values) where mean pairwise L2 distance across branches exceeds threshold,
+        or None if B < 2 or the threshold is never exceeded.
+        """
+        if plan_last.shape[1] < 2:
+            return None
+        plans = self._unnormalize_x(plan_last)[:-1]
+        if obs_only:
+            x, _, _ = self.split_bundle(plans)
+        else:
+            x = plans
+        for t in range(x.shape[0]):
+            d = torch.pdist(x[t], p=2).max()
+            # print("d:", d)
+            if d > threshold:
+                print("Found deviation at timestep", t)
+                return t
+        print("No deviation found, returning last timestep", x.shape[0] - 1)
+        return x.shape[0] - 1
+
+    def _decide_children_stable_prefix(self, node, t_div):
         remaining = node.plan_tokens - node.tokens_committed
         if remaining <= 0:
             return 0
-        # TODO: from node.value_estimation_plan, detect contiguous low-multimodality
-        # leading region and return its length. For now, fully autoregressive.
-        return 4
-    
+        # From node.value_estimation_plan, detect contiguous low-multimodality
+        # leading region and return its length.
+        if t_div is None:
+            return 1  # Fully autoregressive
+        return t_div // self.frame_stack
+
     def _build_expansion_slab(self, c, s, T, plan_tokens):
         """Slab that commits tokens [c : c+s] while first c stay at 0 and rest stay at T."""
-        entry = np.concatenate([
-            np.zeros(c, dtype=np.int32),
-            np.full(plan_tokens - c, T, dtype=np.int32),
-        ])
+        entry = np.concatenate(
+            [
+                np.zeros(c, dtype=np.int32),
+                np.full(plan_tokens - c, T, dtype=np.int32),
+            ]
+        )
         rows = [entry]
         for step in range(1, T + s):
             row = rows[-1].copy()
@@ -1646,7 +2014,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         #     virtual_visit_weight=self.virtual_visit_weight,
         # )
         # root_node.set_value(0)  # Initialize the value of the root node
-        
+
         root_node = TreeNode(
             "0",
             0,
@@ -1664,6 +2032,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Search
         search_num, p_search_num, solved, achieved = 0, 0, False, False
+        self._mctd_pairwise_first_divergence_timesteps = []
         achieved_plans = []  # the plans that achieved the goal through the rollout
         not_reached_plans = (
             []
@@ -1792,196 +2161,261 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             selection_end_time = time.time()
             selection_time.append(selection_end_time - selection_start_time)
 
-            filtered_expanded_node_plan_hists = [None] * len(expanded_node_candidates)
-            filtered_value_estimation_plan_hists = [None] * len(
-                expanded_node_candidates
-            )
-            for _ in range(
-                self.num_tries_for_bad_plans
-            ):  # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
-                ###############################
-                # Expansion
-                expansion_start_time = time.time()
-                # print("============ Expansion Start ============")
-                expanded_node_plans = []
-                expanded_node_noise_levels = []
-                expanded_node_guidance_scales = []
-                for info in expanded_node_candidates:
-                    if len(info["plan_history"]) == 0:
-                        expanded_node_plans.append(None)
-                    else:
-                        expanded_node_plans.append(
-                            info["plan_history"][-1][-1].unsqueeze(1)
-                        )
-                    # _noise_level = noise_level[
-                    #     (info["depth"] - 1)
-                    #     * num_denoising_steps : (
-                    #         info["depth"] * num_denoising_steps + 1
-                    #     )
-                    # ]
-                    # _noise_level = np.concatenate(
-                    #     [_noise_level]
-                    #     + [noise_level[-1:]]
-                    #     * (num_denoising_steps - _noise_level.shape[0] + 1)
-                    # )
-                    # expanded_node_noise_levels.append(_noise_level)
-                    c = info["tokens_committed"] - info["stable_prefix"]  # tokens at 0 entering this expansion
-                    s = info["stable_prefix"]
-                    _noise_level = self._build_expansion_slab(c, s, T, plan_tokens)
-                    expanded_node_noise_levels.append(_noise_level)
-                    
-                    
-                    expanded_node_guidance_scales.append(info["guidance_scale"])
-                expanded_node_guidance_scales = torch.tensor(
-                    expanded_node_guidance_scales
-                ).to(
-                    obs_normalized.device
-                )  # (batch_size,)
-                
-                # After the for-loop over expanded_node_candidates, before np.array(...)
-                max_len = max(nl.shape[0] for nl in expanded_node_noise_levels)
-                for i, nl in enumerate(expanded_node_noise_levels):
-                    if nl.shape[0] < max_len:
-                        pad = np.tile(nl[-1:], (max_len - nl.shape[0], 1))
-                        expanded_node_noise_levels[i] = np.concatenate([nl, pad], axis=0)
-                expanded_node_noise_levels = np.array(expanded_node_noise_levels, dtype=np.int32)
-                
-                # expanded_node_noise_levels = np.array(
-                #     expanded_node_noise_levels, dtype=np.int32
-                # )  # (batch_size, height, width)
-                
-                expanded_node_plan_hists = self.parallel_plan(
-                    obs_normalized,
-                    goal_normalized,
-                    horizon,
-                    conditions,
-                    guidance_scale=expanded_node_guidance_scales,
-                    noise_level=expanded_node_noise_levels,
-                    plan=expanded_node_plans,
+            batch_expanded_node_plan_hists = []
+            batch_value_estimation_plan_hists = []
+            for _ in range(5):  # Run simulation multiple times to get a batch of plans
+                filtered_expanded_node_plan_hists = [None] * len(
+                    expanded_node_candidates
                 )
-                # print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
-                # print("============ Expansion End ============")
-                expansion_end_time = time.time()
-                expansion_time.append(expansion_end_time - expansion_start_time)
+                filtered_value_estimation_plan_hists = [None] * len(
+                    expanded_node_candidates
+                )
+                for _ in range(
+                    self.num_tries_for_bad_plans
+                ):  # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
+                    ###############################
+                    # Expansion
+                    expansion_start_time = time.time()
+                    # print("============ Expansion Start ============")
+                    expanded_node_plans = []
+                    expanded_node_noise_levels = []
+                    expanded_node_guidance_scales = []
+                    for info in expanded_node_candidates:
+                        if len(info["plan_history"]) == 0:
+                            expanded_node_plans.append(None)
+                        else:
+                            expanded_node_plans.append(
+                                info["plan_history"][-1][-1].unsqueeze(1)
+                            )
+                        # _noise_level = noise_level[
+                        #     (info["depth"] - 1)
+                        #     * num_denoising_steps : (
+                        #         info["depth"] * num_denoising_steps + 1
+                        #     )
+                        # ]
+                        # _noise_level = np.concatenate(
+                        #     [_noise_level]
+                        #     + [noise_level[-1:]]
+                        #     * (num_denoising_steps - _noise_level.shape[0] + 1)
+                        # )
+                        # expanded_node_noise_levels.append(_noise_level)
+                        c = (
+                            info["tokens_committed"] - info["stable_prefix"]
+                        )  # tokens at 0 entering this expansion
+                        s = info["stable_prefix"]
+                        _noise_level = self._build_expansion_slab(c, s, T, plan_tokens)
+                        expanded_node_noise_levels.append(_noise_level)
 
-                ###############################
-                # Simulation
-                #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
-                simulation_start_time = time.time()
-                # print("============ Simulation Start ============")
+                        expanded_node_guidance_scales.append(info["guidance_scale"])
+                    expanded_node_guidance_scales = torch.tensor(
+                        expanded_node_guidance_scales
+                    ).to(
+                        obs_normalized.device
+                    )  # (batch_size,)
 
-                # Pad the noise levels - Sequential
-                simul_noiselevel_zero_padding_start = time.time()
-                value_estimation_plans, value_estimation_noise_levels = [], []
-                max_denoising_steps = 0
-                for i in range(
-                    len(expanded_node_candidates)
-                ):  # find the max denoising steps
-                    # _noise_level = np.concatenate(
-                    #     [
-                    #         noise_level[
-                    #             (
-                    #                 expanded_node_candidates[i]["depth"]
-                    #                 * num_denoising_steps
-                    #             ) :: skip_level_steps
-                    #         ],
-                    #         noise_level[-1:],
-                    #     ],
-                    #     axis=0,
-                    # )
-                    
-                    c_new = expanded_node_candidates[i]["tokens_committed"]  # already includes this expansion's commit
-                    _noise_level = self._build_valuation_slab(c_new, T, plan_tokens, skip_level_steps)
-                    
-                    # update max denoising steps
-                    if _noise_level.shape[0] > max_denoising_steps:
-                        max_denoising_steps = _noise_level.shape[0]
-                    value_estimation_noise_levels.append(_noise_level)
-                    value_estimation_plans.append(
-                        expanded_node_plan_hists[-1, :, i].unsqueeze(1)
+                    # After the for-loop over expanded_node_candidates, before np.array(...)
+                    max_len = max(nl.shape[0] for nl in expanded_node_noise_levels)
+                    for i, nl in enumerate(expanded_node_noise_levels):
+                        if nl.shape[0] < max_len:
+                            pad = np.tile(nl[-1:], (max_len - nl.shape[0], 1))
+                            expanded_node_noise_levels[i] = np.concatenate(
+                                [nl, pad], axis=0
+                            )
+                    expanded_node_noise_levels = np.array(
+                        expanded_node_noise_levels, dtype=np.int32
                     )
-                for i in range(len(expanded_node_candidates)):  # zero-padding
-                    length = value_estimation_noise_levels[i].shape[0]
-                    if length < max_denoising_steps:
-                        value_estimation_noise_levels[i] = np.concatenate(
-                            [
-                                value_estimation_noise_levels[i],
-                                np.zeros(
-                                    (
-                                        max_denoising_steps - length,
-                                        value_estimation_noise_levels[i].shape[1],
+
+                    # expanded_node_noise_levels = np.array(
+                    #     expanded_node_noise_levels, dtype=np.int32
+                    # )  # (batch_size, height, width)
+
+                    expanded_node_plan_hists = self.parallel_plan(
+                        obs_normalized,
+                        goal_normalized,
+                        horizon,
+                        conditions,
+                        guidance_scale=expanded_node_guidance_scales,
+                        noise_level=expanded_node_noise_levels,
+                        plan=expanded_node_plans,
+                    )
+                    # print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
+                    # print("============ Expansion End ============")
+                    expansion_end_time = time.time()
+                    expansion_time.append(expansion_end_time - expansion_start_time)
+
+                    ###############################
+                    # Simulation
+                    #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
+                    simulation_start_time = time.time()
+                    # print("============ Simulation Start ============")
+
+                    # Pad the noise levels - Sequential
+                    simul_noiselevel_zero_padding_start = time.time()
+                    value_estimation_plans, value_estimation_noise_levels = [], []
+                    max_denoising_steps = 0
+                    for i in range(
+                        len(expanded_node_candidates)
+                    ):  # find the max denoising steps
+                        # _noise_level = np.concatenate(
+                        #     [
+                        #         noise_level[
+                        #             (
+                        #                 expanded_node_candidates[i]["depth"]
+                        #                 * num_denoising_steps
+                        #             ) :: skip_level_steps
+                        #         ],
+                        #         noise_level[-1:],
+                        #     ],
+                        #     axis=0,
+                        # )
+
+                        c_new = expanded_node_candidates[i][
+                            "tokens_committed"
+                        ]  # already includes this expansion's commit
+                        _noise_level = self._build_valuation_slab(
+                            c_new, T, plan_tokens, skip_level_steps
+                        )
+
+                        # update max denoising steps
+                        if _noise_level.shape[0] > max_denoising_steps:
+                            max_denoising_steps = _noise_level.shape[0]
+                        value_estimation_noise_levels.append(_noise_level)
+                        value_estimation_plans.append(
+                            expanded_node_plan_hists[-1, :, i].unsqueeze(1)
+                        )
+                    for i in range(len(expanded_node_candidates)):  # zero-padding
+                        length = value_estimation_noise_levels[i].shape[0]
+                        if length < max_denoising_steps:
+                            value_estimation_noise_levels[i] = np.concatenate(
+                                [
+                                    value_estimation_noise_levels[i],
+                                    np.zeros(
+                                        (
+                                            max_denoising_steps - length,
+                                            value_estimation_noise_levels[i].shape[1],
+                                        ),
+                                        dtype=np.int32,
                                     ),
-                                    dtype=np.int32,
-                                ),
-                            ],
-                            axis=0,
-                        )  # zero-padding
-                simul_noiselevel_zero_padding_end = time.time()
-                simul_noiselevel_zero_padding_time.append(
-                    simul_noiselevel_zero_padding_end
-                    - simul_noiselevel_zero_padding_start
-                )
+                                ],
+                                axis=0,
+                            )  # zero-padding
+                    simul_noiselevel_zero_padding_end = time.time()
+                    simul_noiselevel_zero_padding_time.append(
+                        simul_noiselevel_zero_padding_end
+                        - simul_noiselevel_zero_padding_start
+                    )
 
-                # Simulation - Value Estimation
-                simul_value_estimation_start = time.time()
-                value_estimation_noise_levels = np.array(
-                    value_estimation_noise_levels, dtype=np.int32
-                )
-                value_estimation_plan_hists = self.parallel_plan(
-                    obs_normalized,
-                    goal_normalized,
-                    horizon,
-                    conditions,
-                    guidance_scale=expanded_node_guidance_scales,
-                    noise_level=value_estimation_noise_levels,
-                    plan=value_estimation_plans,
-                )
-                simul_value_estimation_end = time.time()
-                # print(
-                #     f"Value estimation plan hist: {value_estimation_plan_hists.shape}"
-                # )
+                    # Simulation - Value Estimation
+                    simul_value_estimation_start = time.time()
+                    value_estimation_noise_levels = np.array(
+                        value_estimation_noise_levels, dtype=np.int32
+                    )
+                    value_estimation_plan_hists = self.parallel_plan(
+                        obs_normalized,
+                        goal_normalized,
+                        horizon,
+                        conditions,
+                        guidance_scale=expanded_node_guidance_scales,
+                        noise_level=value_estimation_noise_levels,
+                        plan=value_estimation_plans,
+                    )
+                    simul_value_estimation_end = time.time()
+                    # print(
+                    #     f"Value estimation plan hist: {value_estimation_plan_hists.shape}"
+                    # )
 
-                # check if any plan is good
-                plans = (
-                    self._unnormalize_x(value_estimation_plan_hists[-1])[:-1]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
-                diffs = np.linalg.norm(
-                    plans[1:] - plans[:-1], axis=-1
-                )  # (plan_len-1, N)
-                for i in range(diffs.shape[1]):
-                    if filtered_expanded_node_plan_hists[i] is None and not np.all(
-                        diffs[:, i] < 0.001  # TODO: make this a parameter
-                    ):
+                    # check if any plan is good
+                    plans = (
+                        self._unnormalize_x(value_estimation_plan_hists[-1])[:-1]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    diffs = np.linalg.norm(
+                        plans[1:] - plans[:-1], axis=-1
+                    )  # (plan_len-1, N)
+                    for i in range(diffs.shape[1]):
+                        if filtered_expanded_node_plan_hists[i] is None and not np.all(
+                            diffs[:, i] < 0.001  # FIXME: make this a parameter
+                        ):
+                            filtered_expanded_node_plan_hists[i] = (
+                                expanded_node_plan_hists[:, :, i]
+                            )
+                            filtered_value_estimation_plan_hists[i] = (
+                                value_estimation_plan_hists[:, :, i]
+                            )
+                    if None in filtered_expanded_node_plan_hists:
+                        print("No good plan found, resampling")
+                        simulation_end_time = time.time()
+                        simulation_time.append(
+                            simulation_end_time - simulation_start_time
+                        )
+                        continue
+                    else:
+                        break
+                for i in range(len(filtered_expanded_node_plan_hists)):
+                    if filtered_expanded_node_plan_hists[i] is None:
                         filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
                             :, :, i
                         ]
                         filtered_value_estimation_plan_hists[i] = (
                             value_estimation_plan_hists[:, :, i]
                         )
-                if None in filtered_expanded_node_plan_hists:
-                    print("No good plan found, resampling")
-                    simulation_end_time = time.time()
-                    simulation_time.append(simulation_end_time - simulation_start_time)
-                    continue
-                else:
-                    break
-            for i in range(len(filtered_expanded_node_plan_hists)):
-                if filtered_expanded_node_plan_hists[i] is None:
-                    filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
-                        :, :, i
-                    ]
-                    filtered_value_estimation_plan_hists[i] = (
-                        value_estimation_plan_hists[:, :, i]
+                expanded_node_plan_hists = torch.stack(
+                    filtered_expanded_node_plan_hists, dim=2
+                )
+                value_estimation_plan_hists = torch.stack(
+                    filtered_value_estimation_plan_hists, dim=2
+                )
+                batch_expanded_node_plan_hists.append(expanded_node_plan_hists)
+                batch_value_estimation_plan_hists.append(value_estimation_plan_hists)
+
+            expanded_node_plan_hists = torch.cat(batch_expanded_node_plan_hists, dim=2)
+            value_estimation_plan_hists = torch.cat(
+                batch_value_estimation_plan_hists, dim=2
+            )
+
+            if self.mctd_pairwise_divergence_threshold is not None:
+                t_div = self._first_timestep_deviation_exceeds(
+                    value_estimation_plan_hists[-1],
+                    float(self.mctd_pairwise_divergence_threshold),
+                )
+                self._mctd_pairwise_first_divergence_timesteps.append(t_div)
+            else:
+                t_div = None
+
+            if (
+                self.viz_mctd_batch_plans
+                and self.viz_mctd_batch_plans_every_n_search > 0
+                and (search_num % self.viz_mctd_batch_plans_every_n_search == 0)
+            ):
+                # Best-effort visualization; never fail planning due to rendering issues.
+                try:
+                    start_xy = np.asarray(start[0, :2], dtype=np.float64)
+                    goal_xy = np.asarray(goal[0, :2], dtype=np.float64)
+                    plan_phys = self._unnormalize_x(value_estimation_plan_hists[-1])
+                    obs_traj, _, _ = self.split_bundle(plan_phys)
+                    states_batch = obs_traj[:-1].detach().cpu().numpy()  # (T, B, D_obs)
+                    max_b = self.viz_mctd_batch_plans_max_branches
+                    if max_b is not None:
+                        max_b = int(max_b)
+                    self._log_or_save_pushboundary_2d_batch_gif(
+                        namespace="mctd",
+                        states=states_batch,
+                        sample_idx=0,
+                        suffix=f"mctd_batch_rollouts_search_{search_num}",
+                        start_marker=start_xy,
+                        goal_marker=goal_xy,
+                        block_shape=self._pushboundary_2d_viz_block_shape,
+                        gif_out_dir=self.viz_mctd_batch_plans_out_dir,
+                        alpha=self.viz_mctd_batch_plans_alpha,
+                        max_branches=max_b,
+                        t_div=t_div,
+                        seed=int(getattr(self, "interaction_seed", 0)),
                     )
-            expanded_node_plan_hists = torch.stack(
-                filtered_expanded_node_plan_hists, dim=2
-            )
-            value_estimation_plan_hists = torch.stack(
-                filtered_value_estimation_plan_hists, dim=2
-            )
+                    breakpoint()
+                except Exception:
+                    pass
 
             # Value Calculation
             simul_value_calculation_start = time.time()
@@ -2030,9 +2464,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                         ] = value_estimation_plan
                         expanded_node_infos[name]["plan_history"][-1] = plan_hist
             for name in selected_nodes_for_expansion:
-                child = selected_nodes_for_expansion[name].expand(**expanded_node_infos[name])
-                # TODO: this is a dummy function and should be determined based on multimodality estimate from simulation step
-                child.children_stable_prefix = self._decide_children_stable_prefix(child)
+                child = selected_nodes_for_expansion[name].expand(
+                    **expanded_node_infos[name]
+                )
+                child.children_stable_prefix = self._decide_children_stable_prefix(
+                    child, t_div
+                )
             simul_node_allocation_end = time.time()
             simul_node_allocation_time.append(
                 simul_node_allocation_end - simul_node_allocation_start
@@ -2112,15 +2549,15 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         if solved:
             # Get the final state the agent planned
             final_planned_state = solved_plan[-1]
-            
+
             # Replace NaNs in the goal bundle with the agent's final planned state
             patched_goal_bundle = torch.where(
-                torch.isnan(goal_bundle), 
-                final_planned_state, 
-                goal_bundle
+                torch.isnan(goal_bundle), final_planned_state, goal_bundle
             )
-            
-            output_plan = torch.cat([solved_plan[:, None], patched_goal_bundle[None]], dim=0)[
+
+            output_plan = torch.cat(
+                [solved_plan[:, None], patched_goal_bundle[None]], dim=0
+            )[
                 None
             ]  # (1, t, 1, c)
         else:
@@ -2178,4 +2615,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             f"validation_time/simul_node_allocation_time",
             np.sum(simul_node_allocation_time),
         )
+
+        if self.mctd_pairwise_divergence_threshold is not None:
+            self._mctd_last_pairwise_divergence_snapshot = {
+                "mctd_pairwise_divergence_threshold": float(
+                    self.mctd_pairwise_divergence_threshold
+                ),
+                "pairwise_first_divergence_timesteps": self._mctd_pairwise_first_divergence_timesteps,
+                "search_num": int(search_num),
+                "p_search_num": int(p_search_num),
+                "global_step": getattr(self, "global_step", None),
+            }
+        else:
+            self._mctd_last_pairwise_divergence_snapshot = None
+
         return solved, output_plan

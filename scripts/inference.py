@@ -317,7 +317,7 @@ def parse_args():
     )
     parser.add_argument(
         "--mode",
-        choices=["unguided", "guided", "mctd"],
+        choices=["unguided", "guided", "mctd", "mctd_fast"],
         default="unguided",
         help="Inference mode",
     )
@@ -437,6 +437,18 @@ def parse_args():
             "Goal-achievement threshold in unnormalized obs-space units (block xy coordinates only)"
         ),
     )
+    parser.add_argument(
+        "--scheduling_matrix",
+        type=str,
+        default="pyramid",
+        help="Scheduling matrix (default: pyramid)",
+    )
+    parser.add_argument(
+        "--divergence_threshold",
+        type=float,
+        default=None,
+        help="MCTD-only: pairwise divergence threshold in unnormalized obs-space units (default: null)",
+    )
     return parser.parse_args()
 
 
@@ -472,10 +484,13 @@ def _build_hydra_overrides(args) -> list[str]:
         "algorithm.no_sim_env=true",
         f"algorithm.viz_block_shape={args.block_shape}",
         f"algorithm.frame_stack={_FRAME_STACK}",
+        f"algorithm.scheduling_matrix={args.scheduling_matrix}",
     ]
 
-    if args.mode == "mctd":
+    if args.mode in ("mctd", "mctd_fast"):
         overrides.append("algorithm.mctd=true")
+        if args.mode == "mctd_fast":
+            overrides.append("+algorithm._name=df_planning_fast")
         if args.max_search_num is not None:
             overrides.append(f"algorithm.mctd_max_search_num={args.max_search_num}")
         if args.num_denoising_steps is not None:
@@ -491,6 +506,10 @@ def _build_hydra_overrides(args) -> list[str]:
             )
         overrides.append(f"algorithm.warp_threshold={args.warp_threshold}")
         overrides.append(f"algorithm.goal_threshold={args.goal_threshold}")
+        if args.divergence_threshold is not None:
+            overrides.append(
+                f"algorithm.mctd_pairwise_divergence_threshold={args.divergence_threshold}"
+            )
 
     return overrides
 
@@ -505,7 +524,7 @@ def load_config(args):
     with open_dict(cfg):
         cfg.experiment._name = "exp_planning"
         cfg.dataset._name = "pushblock_offline"
-        cfg.algorithm._name = "df_planning"
+        # cfg.algorithm._name = "df_planning"
     return cfg
 
 
@@ -793,6 +812,7 @@ def run_mctd(
     device: torch.device,
 ):
     """Run MCTD planning (algo.p_mctd_plan) for each start/goal pair."""
+    mode_tag = str(getattr(args, "mode", "mctd"))
     obs_mean = np.array(algo.observation_mean, dtype=np.float32)
     obs_std = np.array(algo.observation_std, dtype=np.float32)
 
@@ -841,7 +861,7 @@ def run_mctd(
     model_device = next(algo.parameters()).device
 
     for i in range(args.num_samples):
-        print(f"[{i+1}/{args.num_samples}] Running MCTD search...")
+        print(f"[{i+1}/{args.num_samples}] Running {mode_tag} search...")
         start_i = start_norm[i : i + 1].to(model_device).float().contiguous()
         goal_i = goal_norm[i : i + 1].to(model_device).float().contiguous()
         start_unnorm_i = start_unnorm[i : i + 1]
@@ -863,7 +883,7 @@ def run_mctd(
         _append_jsonl(
             times_path,
             {
-                "mode": "mctd",
+                "mode": mode_tag,
                 "sample_idx": int(i),
                 "time_sec": float(dt),
                 "horizon": int(horizon),
@@ -887,7 +907,7 @@ def run_mctd(
             _append_jsonl(
                 pd_path,
                 {
-                    "mode": "mctd",
+                    "mode": mode_tag,
                     "sample_idx": int(i),
                     "solved": bool(solved),
                     "time_sec": float(dt),
@@ -936,13 +956,13 @@ def run_mctd(
             solved=np.bool_(solved and valid),
             source="mctd_inference",
             version=np.int32(1),
-            mode="mctd",
+            mode=mode_tag,
             horizon=np.int32(horizon),
             seed=np.int32(args.seed),
         )
         print(f"  Saved plan to {out_path}")
         algo._log_or_save_pushboundary_2d_gif(
-            namespace="mctd",
+            namespace=mode_tag,
             states=states,
             sample_idx=i,
             suffix=suffix,
@@ -1206,6 +1226,8 @@ def main():
             )
     elif args.mode == "mctd":
         run_mctd(algo, dataset, args, output_dir / "mctd", device)
+    elif args.mode == "mctd_fast":
+        run_mctd(algo, dataset, args, output_dir / "mctd_fast", device)
 
     # Write summary aggregating all timing files written during this run.
     records: list[dict] = []
