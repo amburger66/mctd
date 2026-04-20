@@ -1,5 +1,6 @@
 from typing import Optional, Any
 from omegaconf import DictConfig
+import json
 import time
 import numpy as np
 from random import random
@@ -73,6 +74,9 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         self.parallel_multiple_visits = cfg.parallel_multiple_visits
         self.early_stopping_condition = cfg.early_stopping_condition
         self.num_tries_for_bad_plans = cfg.num_tries_for_bad_plans
+        self.mctd_pairwise_divergence_threshold = cfg.get(
+            "mctd_pairwise_divergence_threshold", None
+        )
         self.sub_goal_interval = cfg.sub_goal_interval
         self.viz_plans = cfg.viz_plans
         self._pushboundary_2d_viz_block_shape = cfg.get("viz_block_shape", "square")
@@ -89,24 +93,20 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         **kwargs,
     ) -> None:
         """
-        Render a low-dim PushBoundary (18D state / 9D action) trajectory as a birds-eye GIF.
+        Render PushBoundary (14D state) as a birds-eye GIF.
 
-        Delegates to _log_or_save_pushboundary_2d_gif with the correct index mapping for
-        the 18D state layout:
-          dims 0-1   gripper XY
-          dims 9-10  block XY
-          dims 12-17 block 6D rotation (first two rows of rotation matrix)
-        Block rotation (yaw) is extracted and drawn as a rotated polygon.
-        `actions` is accepted for API compatibility but is not used.
+        State layout: TCP xy (0–1), block xy (2–3), yaw cos/sin (4–5), four obstacle
+        centers as xy pairs (6–13). `actions` is accepted for API compatibility but unused.
         """
         self._log_or_save_pushboundary_2d_gif(
             namespace=namespace,
             states=states,
             sample_idx=sample_idx,
             tcp_xy_indices=(0, 1),
-            block_xy_indices=(9, 10),
-            block_rot6d_indices=(12, 13, 14, 15, 16, 17),
+            block_xy_indices=(2, 3),
+            block_yaw_indices=(4, 5),
             block_shape=self._pushboundary_2d_viz_block_shape,
+            **kwargs,
         )
 
     def _log_or_save_pushboundary_2d_gif(
@@ -138,10 +138,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         tcp_xy_indices: which two state dims are gripper x,y (default (0,1)).
         block_xy_indices: which two state dims are block x,y (default (2,3)).
-        block_yaw_indices: if provided, a tuple of state dims holding (cos, sin) of the block yaw.
+        block_yaw_indices: if provided, state dims holding (cos, sin) of block yaw; if None, axis-aligned block.
+        Obstacle centers: consecutive xy pairs from index 6 onward (14D = four obstacles at 6–13).
         """
         print("Rendering pushboundary 2d visualization...")
         min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
+        if block_yaw_indices is not None:
+            min_dim = max(min_dim, max(block_yaw_indices) + 1)
         if states.ndim != 2 or states.shape[-1] < min_dim:
             return
 
@@ -463,6 +466,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 duration=duration_ms,
                 loop=0,
             )
+            print("Saved to:", out_path_gif)
         else:
             duration_ms = int(1000.0 / fps)
             pil_frames = [Image.fromarray(f) for f in frames_img]
@@ -473,6 +477,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 duration=duration_ms,
                 loop=0,
             )
+            print("Saved to:", out_path)
 
         if self.logger is not None:
             try:
@@ -591,14 +596,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 # last observation is dummy => drop it for both states and actions
                 states = o_np[:-1, sample_idx, :]
                 actions = a_np[:-1, sample_idx, :]
-                if self.observation_dim >= 18:
-                    self._log_or_save_pushboundary_pcd_gif(
-                        namespace="training",
-                        states=states,
-                        actions=actions,
-                        sample_idx=sample_idx,
-                    )
-                elif self.observation_dim >= 4:
+                if self.observation_dim >= 4:
                     self._log_or_save_pushboundary_2d_gif(
                         namespace="training",
                         states=states,
@@ -1104,13 +1102,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 obs_traj, _, _ = self.split_bundle(plan[:, i : i + 1, :])
                 states = obs_traj[:, 0, :].detach().cpu().numpy()
                 np.save(out_root / f"plan_{i}.npy", states)
-                viz_kwargs = {}
-                if self.observation_dim >= 18:
-                    viz_kwargs = dict(
-                        tcp_xy_indices=(0, 1),
-                        block_xy_indices=(9, 10),
-                        block_rot6d_indices=(12, 13, 14, 15, 16, 17),
-                    )
                 self._log_or_save_pushboundary_2d_gif(
                     namespace=namespace,
                     states=states,
@@ -1119,7 +1110,6 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                     start_marker=start_np[i, :2],
                     goal_marker=goal_np[i, :2],
                     block_shape=self._pushboundary_2d_viz_block_shape,
-                    **viz_kwargs,
                 )
 
             # TODO: Execute plan in ManiSkill environment (once hooked up).
@@ -1441,6 +1431,34 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             o, a = torch.split(bundle, [self.observation_dim, self.action_dim], -1)
             return o, a, None
 
+    def _first_timestep_mean_pairwise_dist_exceeds(
+        self,
+        plan_last: torch.Tensor,
+        threshold: float,
+        *,
+        obs_only: bool = True,
+    ) -> Optional[int]:
+        """
+        plan_last: (horizon, B, C) normalized bundle, same as value_estimation_plan_hists[-1].
+
+        Returns the first horizon index t (after dropping the final dummy step, matching
+        calculate_values) where mean pairwise L2 distance across branches exceeds threshold,
+        or None if B < 2 or the threshold is never exceeded.
+        """
+        if plan_last.shape[1] < 2:
+            return None
+        plans = self._unnormalize_x(plan_last)[:-1]
+        if obs_only:
+            x, _, _ = self.split_bundle(plans)
+        else:
+            x = plans
+        for t in range(x.shape[0]):
+            d = torch.pdist(x[t], p=2).max()
+            print("d:", d)
+            if d > threshold:
+                return t
+        return None
+
     def make_bundle(
         self,
         obs: Optional[torch.Tensor] = None,
@@ -1600,6 +1618,8 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
 
         # Search
         search_num, p_search_num, solved, achieved = 0, 0, False, False
+        self._mctd_pairwise_first_divergence_timesteps = []
+        self._mctd_pairwise_first_divergence_timestep = None
         achieved_plans = []  # the plans that achieved the goal through the rollout
         not_reached_plans = (
             []
@@ -1728,177 +1748,218 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             selection_end_time = time.time()
             selection_time.append(selection_end_time - selection_start_time)
 
-            filtered_expanded_node_plan_hists = [None] * len(expanded_node_candidates)
-            filtered_value_estimation_plan_hists = [None] * len(
-                expanded_node_candidates
-            )
-            for _ in range(
-                self.num_tries_for_bad_plans
-            ):  # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
-                ###############################
-                # Expansion
-                expansion_start_time = time.time()
-                # print("============ Expansion Start ============")
-                expanded_node_plans = []
-                expanded_node_noise_levels = []
-                expanded_node_guidance_scales = []
-                for info in expanded_node_candidates:
-                    if len(info["plan_history"]) == 0:
-                        expanded_node_plans.append(None)
-                    else:
-                        expanded_node_plans.append(
-                            info["plan_history"][-1][-1].unsqueeze(1)
-                        )
-                    _noise_level = noise_level[
-                        (info["depth"] - 1)
-                        * num_denoising_steps : (
-                            info["depth"] * num_denoising_steps + 1
-                        )
-                    ]
-                    # if info["depth"] == terminal_depth:
-                    _noise_level = np.concatenate(
-                        [_noise_level]
-                        + [noise_level[-1:]]
-                        * (num_denoising_steps - _noise_level.shape[0] + 1)
-                    )
-                    expanded_node_noise_levels.append(_noise_level)
-                    expanded_node_guidance_scales.append(info["guidance_scale"])
-                expanded_node_guidance_scales = torch.tensor(
-                    expanded_node_guidance_scales
-                ).to(
-                    obs_normalized.device
-                )  # (batch_size,)
-                expanded_node_noise_levels = np.array(
-                    expanded_node_noise_levels, dtype=np.int32
-                )  # (batch_size, height, width)
-                expanded_node_plan_hists = self.parallel_plan(
-                    obs_normalized,
-                    goal_normalized,
-                    horizon,
-                    conditions,
-                    guidance_scale=expanded_node_guidance_scales,
-                    noise_level=expanded_node_noise_levels,
-                    plan=expanded_node_plans,
+            batch_expanded_node_plan_hists = []
+            batch_value_estimation_plan_hists = []
+            for _ in range(5):  # Run simulation multiple times to get a batch of plans
+                filtered_expanded_node_plan_hists = [None] * len(
+                    expanded_node_candidates
                 )
-                # print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
-                # print("============ Expansion End ============")
-                expansion_end_time = time.time()
-                expansion_time.append(expansion_end_time - expansion_start_time)
-
-                ###############################
-                # Simulation
-                #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
-                simulation_start_time = time.time()
-                # print("============ Simulation Start ============")
-
-                # Pad the noise levels - Sequential
-                simul_noiselevel_zero_padding_start = time.time()
-                value_estimation_plans, value_estimation_noise_levels = [], []
-                max_denoising_steps = 0
-                for i in range(
-                    len(expanded_node_candidates)
-                ):  # find the max denoising steps
-                    _noise_level = np.concatenate(
-                        [
-                            noise_level[
-                                (
-                                    expanded_node_candidates[i]["depth"]
-                                    * num_denoising_steps
-                                ) :: skip_level_steps
-                            ],
-                            noise_level[-1:],
-                        ],
-                        axis=0,
+                filtered_value_estimation_plan_hists = [None] * len(
+                    expanded_node_candidates
+                )
+                for _ in range(
+                    self.num_tries_for_bad_plans
+                ):  # Trick used in MCTD to resample when the generated plan is terrible (e.g., not moving plans)
+                    ###############################
+                    # Expansion
+                    expansion_start_time = time.time()
+                    # print("============ Expansion Start ============")
+                    expanded_node_plans = []
+                    expanded_node_noise_levels = []
+                    expanded_node_guidance_scales = []
+                    for info in expanded_node_candidates:
+                        if len(info["plan_history"]) == 0:
+                            expanded_node_plans.append(None)
+                        else:
+                            expanded_node_plans.append(
+                                info["plan_history"][-1][-1].unsqueeze(1)
+                            )
+                        _noise_level = noise_level[
+                            (info["depth"] - 1)
+                            * num_denoising_steps : (
+                                info["depth"] * num_denoising_steps + 1
+                            )
+                        ]
+                        # if info["depth"] == terminal_depth:
+                        _noise_level = np.concatenate(
+                            [_noise_level]
+                            + [noise_level[-1:]]
+                            * (num_denoising_steps - _noise_level.shape[0] + 1)
+                        )
+                        expanded_node_noise_levels.append(_noise_level)
+                        expanded_node_guidance_scales.append(info["guidance_scale"])
+                    expanded_node_guidance_scales = torch.tensor(
+                        expanded_node_guidance_scales
+                    ).to(
+                        obs_normalized.device
+                    )  # (batch_size,)
+                    expanded_node_noise_levels = np.array(
+                        expanded_node_noise_levels, dtype=np.int32
+                    )  # (batch_size, height, width)
+                    expanded_node_plan_hists = self.parallel_plan(
+                        obs_normalized,
+                        goal_normalized,
+                        horizon,
+                        conditions,
+                        guidance_scale=expanded_node_guidance_scales,
+                        noise_level=expanded_node_noise_levels,
+                        plan=expanded_node_plans,
                     )
-                    # update max denoising steps
-                    if _noise_level.shape[0] > max_denoising_steps:
-                        max_denoising_steps = _noise_level.shape[0]
-                    value_estimation_noise_levels.append(_noise_level)
-                    value_estimation_plans.append(
-                        expanded_node_plan_hists[-1, :, i].unsqueeze(1)
-                    )
-                for i in range(len(expanded_node_candidates)):  # zero-padding
-                    length = value_estimation_noise_levels[i].shape[0]
-                    if length < max_denoising_steps:
-                        value_estimation_noise_levels[i] = np.concatenate(
+                    # print(f"Expanded node plan hists: {expanded_node_plan_hists.shape}")
+                    # print("============ Expansion End ============")
+                    expansion_end_time = time.time()
+                    expansion_time.append(expansion_end_time - expansion_start_time)
+
+                    ###############################
+                    # Simulation
+                    #  It includes the noise level zero-padding, finding the max denoising steps, simulation, value calculation and node allocation
+                    simulation_start_time = time.time()
+                    # print("============ Simulation Start ============")
+
+                    # Pad the noise levels - Sequential
+                    simul_noiselevel_zero_padding_start = time.time()
+                    value_estimation_plans, value_estimation_noise_levels = [], []
+                    max_denoising_steps = 0
+                    for i in range(
+                        len(expanded_node_candidates)
+                    ):  # find the max denoising steps
+                        _noise_level = np.concatenate(
                             [
-                                value_estimation_noise_levels[i],
-                                np.zeros(
+                                noise_level[
                                     (
-                                        max_denoising_steps - length,
-                                        value_estimation_noise_levels[i].shape[1],
-                                    ),
-                                    dtype=np.int32,
-                                ),
+                                        expanded_node_candidates[i]["depth"]
+                                        * num_denoising_steps
+                                    ) :: skip_level_steps
+                                ],
+                                noise_level[-1:],
                             ],
                             axis=0,
-                        )  # zero-padding
-                simul_noiselevel_zero_padding_end = time.time()
-                simul_noiselevel_zero_padding_time.append(
-                    simul_noiselevel_zero_padding_end
-                    - simul_noiselevel_zero_padding_start
-                )
+                        )
+                        # update max denoising steps
+                        if _noise_level.shape[0] > max_denoising_steps:
+                            max_denoising_steps = _noise_level.shape[0]
+                        value_estimation_noise_levels.append(_noise_level)
+                        value_estimation_plans.append(
+                            expanded_node_plan_hists[-1, :, i].unsqueeze(1)
+                        )
+                    for i in range(len(expanded_node_candidates)):  # zero-padding
+                        length = value_estimation_noise_levels[i].shape[0]
+                        if length < max_denoising_steps:
+                            value_estimation_noise_levels[i] = np.concatenate(
+                                [
+                                    value_estimation_noise_levels[i],
+                                    np.zeros(
+                                        (
+                                            max_denoising_steps - length,
+                                            value_estimation_noise_levels[i].shape[1],
+                                        ),
+                                        dtype=np.int32,
+                                    ),
+                                ],
+                                axis=0,
+                            )  # zero-padding
+                    simul_noiselevel_zero_padding_end = time.time()
+                    simul_noiselevel_zero_padding_time.append(
+                        simul_noiselevel_zero_padding_end
+                        - simul_noiselevel_zero_padding_start
+                    )
 
-                # Simulation - Value Estimation
-                simul_value_estimation_start = time.time()
-                value_estimation_noise_levels = np.array(
-                    value_estimation_noise_levels, dtype=np.int32
-                )
-                value_estimation_plan_hists = self.parallel_plan(
-                    obs_normalized,
-                    goal_normalized,
-                    horizon,
-                    conditions,
-                    guidance_scale=expanded_node_guidance_scales,
-                    noise_level=value_estimation_noise_levels,
-                    plan=value_estimation_plans,
-                )
-                simul_value_estimation_end = time.time()
-                # print(
-                #     f"Value estimation plan hist: {value_estimation_plan_hists.shape}"
-                # )
+                    # Simulation - Value Estimation
+                    simul_value_estimation_start = time.time()
+                    value_estimation_noise_levels = np.array(
+                        value_estimation_noise_levels, dtype=np.int32
+                    )
+                    value_estimation_plan_hists = self.parallel_plan(
+                        obs_normalized,
+                        goal_normalized,
+                        horizon,
+                        conditions,
+                        guidance_scale=expanded_node_guidance_scales,
+                        noise_level=value_estimation_noise_levels,
+                        plan=value_estimation_plans,
+                    )
+                    simul_value_estimation_end = time.time()
+                    # print(
+                    #     f"Value estimation plan hist: {value_estimation_plan_hists.shape}"
+                    # )
 
-                # check if any plan is good
-                plans = (
-                    self._unnormalize_x(value_estimation_plan_hists[-1])[:-1]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
-                diffs = np.linalg.norm(
-                    plans[1:] - plans[:-1], axis=-1
-                )  # (plan_len-1, N)
-                for i in range(diffs.shape[1]):
-                    if filtered_expanded_node_plan_hists[i] is None and not np.all(
-                        diffs[:, i] < 0.001  # TODO: make this a parameter
-                    ):
+                    # check if any plan is good
+                    plans = (
+                        self._unnormalize_x(value_estimation_plan_hists[-1])[:-1]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    diffs = np.linalg.norm(
+                        plans[1:] - plans[:-1], axis=-1
+                    )  # (plan_len-1, N)
+                    for i in range(diffs.shape[1]):
+                        if filtered_expanded_node_plan_hists[i] is None and not np.all(
+                            diffs[:, i] < 0.001  # TODO: make this a parameter
+                        ):
+                            filtered_expanded_node_plan_hists[i] = (
+                                expanded_node_plan_hists[:, :, i]
+                            )
+                            filtered_value_estimation_plan_hists[i] = (
+                                value_estimation_plan_hists[:, :, i]
+                            )
+                    if None in filtered_expanded_node_plan_hists:
+                        print("No good plan found, resampling")
+                        simulation_end_time = time.time()
+                        simulation_time.append(
+                            simulation_end_time - simulation_start_time
+                        )
+                        continue
+                    else:
+                        break
+                for i in range(len(filtered_expanded_node_plan_hists)):
+                    if filtered_expanded_node_plan_hists[i] is None:
                         filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
                             :, :, i
                         ]
                         filtered_value_estimation_plan_hists[i] = (
                             value_estimation_plan_hists[:, :, i]
                         )
-                if None in filtered_expanded_node_plan_hists:
-                    print("No good plan found, resampling")
-                    simulation_end_time = time.time()
-                    simulation_time.append(simulation_end_time - simulation_start_time)
-                    continue
-                else:
-                    break
-            for i in range(len(filtered_expanded_node_plan_hists)):
-                if filtered_expanded_node_plan_hists[i] is None:
-                    filtered_expanded_node_plan_hists[i] = expanded_node_plan_hists[
-                        :, :, i
-                    ]
-                    filtered_value_estimation_plan_hists[i] = (
-                        value_estimation_plan_hists[:, :, i]
-                    )
-            expanded_node_plan_hists = torch.stack(
-                filtered_expanded_node_plan_hists, dim=2
+                expanded_node_plan_hists = torch.stack(
+                    filtered_expanded_node_plan_hists, dim=2
+                )  # (M, T, B, C)
+                value_estimation_plan_hists = torch.stack(
+                    filtered_value_estimation_plan_hists, dim=2
+                )  # (M_jumpy, T, B, C)
+                batch_expanded_node_plan_hists.append(expanded_node_plan_hists)
+                batch_value_estimation_plan_hists.append(value_estimation_plan_hists)
+
+            expanded_node_plan_hists = torch.cat(batch_expanded_node_plan_hists, dim=2)
+            value_estimation_plan_hists = torch.cat(
+                batch_value_estimation_plan_hists, dim=2
             )
-            value_estimation_plan_hists = torch.stack(
-                filtered_value_estimation_plan_hists, dim=2
-            )
+            # Attempt to visualize the plans
+            start_xy = np.asarray(start[0, :2], dtype=np.float64)
+            goal_xy = np.asarray(goal[0, :2], dtype=np.float64)
+            for i in range(expanded_node_plan_hists.shape[2]):
+                plan_norm = expanded_node_plan_hists[-1, :, i : i + 1, :]
+                plan_phys = self._unnormalize_x(plan_norm)
+                obs_traj, _, _ = self.split_bundle(plan_phys)
+                states = obs_traj[:, 0, :].detach().cpu().numpy()
+                self._log_or_save_pushboundary_2d_gif(
+                    namespace="mctd",
+                    states=states,
+                    sample_idx=i,
+                    start_marker=start_xy,
+                    goal_marker=goal_xy,
+                    block_shape=self._pushboundary_2d_viz_block_shape,
+                    gif_out_dir="viz",
+                )
+                # breakpoint()
+            if self.mctd_pairwise_divergence_threshold is not None:
+                t_div = self._first_timestep_mean_pairwise_dist_exceeds(
+                    value_estimation_plan_hists[-1],
+                    float(self.mctd_pairwise_divergence_threshold),
+                )
+                if t_div is not None:
+                    print("Found deviation:", t_div)
+                self._mctd_pairwise_first_divergence_timesteps.append(t_div)
+                self._mctd_pairwise_first_divergence_timestep = t_div
 
             # Value Calculation
             simul_value_calculation_start = time.time()
@@ -2093,4 +2154,18 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             f"validation_time/simul_node_allocation_time",
             np.sum(simul_node_allocation_time),
         )
+
+        if self.mctd_pairwise_divergence_threshold is not None:
+            self._mctd_last_pairwise_divergence_snapshot = {
+                "mctd_pairwise_divergence_threshold": float(
+                    self.mctd_pairwise_divergence_threshold
+                ),
+                "pairwise_first_divergence_timesteps": self._mctd_pairwise_first_divergence_timesteps,
+                "search_num": int(search_num),
+                "p_search_num": int(p_search_num),
+                "global_step": getattr(self, "global_step", None),
+            }
+        else:
+            self._mctd_last_pairwise_divergence_snapshot = None
+
         return solved, output_plan

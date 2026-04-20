@@ -434,7 +434,7 @@ def parse_args():
         type=float,
         default=0.0175,
         help=(
-            "MCTD-only: goal-achievement threshold in unnormalized obs-space units (block xy coordinates only)"
+            "Goal-achievement threshold in unnormalized obs-space units (block xy coordinates only)"
         ),
     )
     return parser.parse_args()
@@ -877,6 +877,24 @@ def run_mctd(
                 "goal_threshold": float(args.goal_threshold),
             },
         )
+
+        snap = getattr(algo, "_mctd_last_pairwise_divergence_snapshot", None)
+        if (
+            getattr(algo, "mctd_pairwise_divergence_threshold", None) is not None
+            and snap is not None
+        ):
+            pd_path = output_dir / "pairwise_first_divergence.jsonl"
+            _append_jsonl(
+                pd_path,
+                {
+                    "mode": "mctd",
+                    "sample_idx": int(i),
+                    "solved": bool(solved),
+                    "time_sec": float(dt),
+                    **snap,
+                },
+            )
+            algo._mctd_pairwise_divergence_last_save_path = str(pd_path.resolve())
 
         # p_mctd_plan may return obs-only (normalized) or full bundle. Handle both.
         # Shapes observed in this codebase:
