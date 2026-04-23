@@ -47,6 +47,8 @@ RUN pip3 install mujoco-py
 RUN pip3 install rotary-embedding-torch
 RUN pip3 install diffusers
 
+RUN pip3 install shapely
+
 # Install additional libraries
 RUN apt-get update
 RUN apt-get -y install libosmesa6-dev patchelf
