@@ -24,17 +24,25 @@ import json
 import os
 import sys
 import time
+import glob
 from pathlib import Path
 
 import numpy as np
-import torch
+try:
+    import torch  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    torch = None  # type: ignore
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _MCTD_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_MCTD_ROOT))
 
 import numpy as np
-from shapely.geometry import Point, Polygon
+try:
+    from shapely.geometry import Point, Polygon  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    Point = None  # type: ignore
+    Polygon = None  # type: ignore
 
 # Default indices for the 6D pushblock_offline observation vector:
 #   [tcp_x, tcp_y, block_x, block_y, yaw_a, yaw_b, obs1_x, obs1_y...]
@@ -55,6 +63,10 @@ OBSTACLE_RADIUS = 0.018
 
 
 def valid_path(obs: np.ndarray, block_shape: str) -> bool:
+    if Point is None or Polygon is None:
+        raise ModuleNotFoundError(
+            "shapely is required for valid_path(); install shapely or run without path validation."
+        )
     # Baseline areas for percentage calculations
     gripper_total_area = np.pi * (STICK_RADIUS**2)
     obstacle_total_area = np.pi * (OBSTACLE_RADIUS**2)
@@ -402,6 +414,52 @@ def parse_args():
         default="square",
         help="BEV block geometry in GIF/MP4 (circle matches envs/push_boundary.py CIRCLE_RADIUS)",
     )
+    # Offline visualization from stored plan_*.npz files (no checkpoint needed).
+    parser.add_argument(
+        "--viz_from_npz_glob",
+        type=str,
+        default=None,
+        help=(
+            "If set, renders static overlay PNG(s) directly from stored plan_*.npz files "
+            "(e.g. 'inference_obstacles/ckpt_400k_autoregressive/mctd/plan_*.npz') and exits."
+        ),
+    )
+    parser.add_argument(
+        "--viz_out_dir",
+        type=Path,
+        default=None,
+        help="Optional output directory for overlay PNGs (default: alongside each .npz).",
+    )
+    parser.add_argument(
+        "--viz_opacity_min",
+        type=float,
+        default=0.05,
+        help="Minimum alpha for earliest timesteps in overlay (default: 0.05).",
+    )
+    parser.add_argument(
+        "--viz_opacity_max",
+        type=float,
+        default=0.95,
+        help="Maximum alpha for latest timesteps in overlay (default: 0.95).",
+    )
+    parser.add_argument(
+        "--viz_gamma",
+        type=float,
+        default=1.0,
+        help="Opacity ramp exponent gamma (default: 1.0 for linear).",
+    )
+    parser.add_argument(
+        "--viz_max_steps",
+        type=int,
+        default=None,
+        help="Optional max number of overlaid steps (subsamples evenly if set).",
+    )
+    parser.add_argument(
+        "--viz_step_stride",
+        type=int,
+        default=5,
+        help="Overlay stride in timesteps (default: 5). Always includes the final step.",
+    )
     # MCTD-specific overrides (used only with --mode mctd)
     parser.add_argument(
         "--max_search_num",
@@ -450,6 +508,58 @@ def parse_args():
         help="MCTD-only: pairwise divergence threshold in unnormalized obs-space units (default: null)",
     )
     return parser.parse_args()
+
+
+def _render_static_overlays_from_npz_glob(args: argparse.Namespace) -> int:
+    from pushboundary_viz import render_pushboundary_plan_static_overlay
+
+    pattern = str(args.viz_from_npz_glob).strip()
+    if not pattern:
+        sys.stderr.write("--viz_from_npz_glob was empty.\n")
+        return 2
+
+    npz_paths = sorted(glob.glob(pattern))
+    if len(npz_paths) == 0:
+        sys.stderr.write(f"No files matched --viz_from_npz_glob={pattern!r}\n")
+        return 2
+
+    n_ok = 0
+    for p_str in npz_paths:
+        p = Path(p_str)
+        try:
+            data = np.load(p, allow_pickle=False)
+            states = np.asarray(data["states"])
+            goal_marker = np.asarray(data["target_xy"]) if "target_xy" in data else None
+            start_marker = (
+                np.asarray(states[0, list(_BLOCK_XY_IDX)], dtype=np.float64)
+                if states.ndim == 2 and states.shape[0] > 0 and states.shape[1] >= 4
+                else None
+            )
+            out_dir = args.viz_out_dir if args.viz_out_dir is not None else p.parent
+            out_path = Path(out_dir) / f"{p.stem}_overlay.png"
+            render_pushboundary_plan_static_overlay(
+                states=states,
+                out_path=out_path,
+                tcp_xy_indices=_TCP_XY_IDX,
+                block_xy_indices=_BLOCK_XY_IDX,
+                block_yaw_indices=_BLOCK_YAW2_IDX if states.shape[1] >= 6 else None,
+                start_marker=start_marker,
+                goal_marker=goal_marker,
+                block_shape=str(args.block_shape),
+                opacity_min=float(args.viz_opacity_min),
+                opacity_max=float(args.viz_opacity_max),
+                gamma=float(args.viz_gamma),
+                step_stride=int(args.viz_step_stride),
+                max_steps=args.viz_max_steps,
+            )
+            print(f"Wrote overlay: {out_path}")
+            n_ok += 1
+        except Exception as e:
+            sys.stderr.write(f"[viz] Failed on {p}: {e}\n")
+
+    if n_ok == 0:
+        return 1
+    return 0
 
 
 def _parse_guidance_scales(s: str | None) -> list[float] | None:
@@ -1143,6 +1253,12 @@ def main():
     global _FRAME_STACK
     args = parse_args()
     _FRAME_STACK = args.frame_stack
+    if args.viz_from_npz_glob is not None:
+        raise SystemExit(_render_static_overlays_from_npz_glob(args))
+    if torch is None:
+        raise ModuleNotFoundError(
+            "torch is required for model inference; install torch or use --viz_from_npz_glob."
+        )
     if (
         args.guidance_scales is not None
         and str(args.guidance_scales).strip()

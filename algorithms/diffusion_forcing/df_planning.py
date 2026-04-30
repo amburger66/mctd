@@ -30,6 +30,117 @@ OGBENCH_ENVS = [
     "antmaze-giant-v0",
     "antmaze-teleport-v0",
 ]
+# --- PushBoundary 2D visualization shared helpers ---
+_PUSHBOUNDARY_BLOCK_HALF = 0.025
+_PUSHBOUNDARY_CIRCLE_RADIUS = 0.025
+_PUSHBOUNDARY_STICK_RADIUS = 0.01
+_PUSHBOUNDARY_OBSTACLE_RADIUS = 0.018
+_PUSHBOUNDARY_PAD = 0.02
+
+
+def _pushboundary_ffill_time_1d(col: np.ndarray) -> np.ndarray:
+    """Forward-fill then back-fill NaN/Inf along time; default 0 if all invalid."""
+    x = np.asarray(col, dtype=np.float64).copy().ravel()
+    for i in range(1, len(x)):
+        if not np.isfinite(x[i]):
+            x[i] = x[i - 1]
+    for i in range(len(x) - 2, -1, -1):
+        if not np.isfinite(x[i]):
+            x[i] = x[i + 1]
+    if not np.isfinite(x).all():
+        x[~np.isfinite(x)] = 0.0
+    return x
+
+
+def _pushboundary_2d_viz_preprocess(
+    *,
+    states: np.ndarray,
+    tcp_xy_indices: tuple = (0, 1),
+    block_xy_indices: tuple = (2, 3),
+    block_yaw_indices: Optional[tuple] = (4, 5),
+) -> tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    list[tuple[float, float]],
+]:
+    min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
+    if block_yaw_indices is not None:
+        min_dim = max(min_dim, max(block_yaw_indices) + 1)
+    if states is None or states.ndim != 2 or states.shape[-1] < min_dim:
+        return None, None, None, None, []
+
+    # Plans (e.g. MCTD) may contain NaN timesteps; matplotlib limits must stay finite.
+    states_viz = np.array(states, dtype=np.float64, copy=True)
+    fix_cols = set(tcp_xy_indices) | set(block_xy_indices)
+    if block_yaw_indices is not None:
+        fix_cols |= set(block_yaw_indices)
+    for c in range(6, states_viz.shape[1]):
+        fix_cols.add(c)
+    for c in sorted(fix_cols):
+        if c < states_viz.shape[1]:
+            states_viz[:, c] = _pushboundary_ffill_time_1d(states_viz[:, c])
+
+    tcp_xy = states_viz[:, list(tcp_xy_indices)]
+    block_xy = states_viz[:, list(block_xy_indices)]
+
+    if block_yaw_indices is not None:
+        idx = block_yaw_indices
+        block_yaws = np.arctan2(states_viz[:, idx[1]], states_viz[:, idx[0]])
+    else:
+        block_yaws = None
+
+    # Everything from index 6 onwards are obstacle xy pairs.
+    num_obstacles = (states_viz.shape[-1] - 6) // 2
+    obstacles_xy: list[tuple[float, float]] = []
+    for i in range(num_obstacles):
+        ox = float(states_viz[0, 6 + 2 * i])
+        oy = float(states_viz[0, 7 + 2 * i])
+        if np.isfinite(ox) and np.isfinite(oy):
+            obstacles_xy.append((ox, oy))
+
+    return states_viz, tcp_xy, block_xy, block_yaws, obstacles_xy
+
+
+def _pushboundary_2d_viz_limits(
+    *,
+    tcp_xy: np.ndarray,
+    block_xy: np.ndarray,
+    obstacles_xy: list[tuple[float, float]],
+    start_marker: Optional[np.ndarray] = None,
+    goal_marker: Optional[np.ndarray] = None,
+) -> tuple[float, float, float, float]:
+    pad = _PUSHBOUNDARY_PAD
+    x_min = min(float(np.min(tcp_xy[:, 0])), float(np.min(block_xy[:, 0]))) - pad
+    x_max = max(float(np.max(tcp_xy[:, 0])), float(np.max(block_xy[:, 0]))) + pad
+    y_min = min(float(np.min(tcp_xy[:, 1])), float(np.min(block_xy[:, 1]))) - pad
+    y_max = max(float(np.max(tcp_xy[:, 1])), float(np.max(block_xy[:, 1]))) + pad
+
+    if start_marker is not None and np.all(np.isfinite(start_marker)):
+        x_min = min(x_min, float(start_marker[0]) - pad)
+        x_max = max(x_max, float(start_marker[0]) + pad)
+        y_min = min(y_min, float(start_marker[1]) - pad)
+        y_max = max(y_max, float(start_marker[1]) + pad)
+    if goal_marker is not None and np.all(np.isfinite(goal_marker)):
+        x_min = min(x_min, float(goal_marker[0]) - pad)
+        x_max = max(x_max, float(goal_marker[0]) + pad)
+        y_min = min(y_min, float(goal_marker[1]) - pad)
+        y_max = max(y_max, float(goal_marker[1]) + pad)
+
+    for ox, oy in obstacles_xy:
+        x_min = min(x_min, ox - _PUSHBOUNDARY_OBSTACLE_RADIUS - pad)
+        x_max = max(x_max, ox + _PUSHBOUNDARY_OBSTACLE_RADIUS + pad)
+        y_min = min(y_min, oy - _PUSHBOUNDARY_OBSTACLE_RADIUS - pad)
+        y_max = max(y_max, oy + _PUSHBOUNDARY_OBSTACLE_RADIUS + pad)
+
+    if (
+        not all(np.isfinite(v) for v in (x_min, x_max, y_min, y_max))
+        or x_min >= x_max
+        or y_min >= y_max
+    ):
+        return -0.35, 0.35, -0.35, 0.35
+    return x_min, x_max, y_min, y_max
 
 
 class DiffusionForcingPlanning(DiffusionForcingBase):
@@ -142,57 +253,16 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         Obstacle centers: consecutive xy pairs from index 6 onward (14D = four obstacles at 6–13).
         """
         print("Rendering pushboundary 2d visualization...")
-        min_dim = max(max(tcp_xy_indices), max(block_xy_indices)) + 1
-        if block_yaw_indices is not None:
-            min_dim = max(min_dim, max(block_yaw_indices) + 1)
-        if states.ndim != 2 or states.shape[-1] < min_dim:
+        states_viz, tcp_xy, block_xy, block_yaws, obstacles_xy = (
+            _pushboundary_2d_viz_preprocess(
+                states=states,
+                tcp_xy_indices=tcp_xy_indices,
+                block_xy_indices=block_xy_indices,
+                block_yaw_indices=block_yaw_indices,
+            )
+        )
+        if states_viz is None:
             return
-
-        def _ffill_time_1d(col: np.ndarray) -> np.ndarray:
-            """Forward-fill then back-fill NaN/Inf along time; default 0 if all invalid."""
-            x = np.asarray(col, dtype=np.float64).copy().ravel()
-            for i in range(1, len(x)):
-                if not np.isfinite(x[i]):
-                    x[i] = x[i - 1]
-            for i in range(len(x) - 2, -1, -1):
-                if not np.isfinite(x[i]):
-                    x[i] = x[i + 1]
-            if not np.isfinite(x).all():
-                x[~np.isfinite(x)] = 0.0
-            return x
-
-        # Plans (e.g. MCTD) may contain NaN timesteps; matplotlib limits must stay finite.
-        states_viz = np.array(states, dtype=np.float64, copy=True)
-        fix_cols = set(tcp_xy_indices) | set(block_xy_indices)
-        if block_yaw_indices is not None:
-            fix_cols |= set(block_yaw_indices)
-        for c in range(6, states_viz.shape[1]):
-            fix_cols.add(c)
-        for c in sorted(fix_cols):
-            if c < states_viz.shape[1]:
-                states_viz[:, c] = _ffill_time_1d(states_viz[:, c])
-
-        tcp_xy = states_viz[:, list(tcp_xy_indices)]
-        block_xy = states_viz[:, list(block_xy_indices)]
-
-        # --- YAW LOGIC ---
-        if block_yaw_indices is not None:
-            idx = block_yaw_indices
-            block_yaws = np.arctan2(states_viz[:, idx[1]], states_viz[:, idx[0]])
-        else:
-            block_yaws = None
-
-        # --- DYNAMIC OBSTACLE LOGIC ---
-        # Assuming states are [tcp_x, tcp_y, block_x, block_y, cos, sin, obs1_x, obs1_y...]
-        # Everything from index 6 onwards are obstacle pairs.
-        num_obstacles = (states_viz.shape[-1] - 6) // 2
-        obstacles_xy = []
-        for i in range(num_obstacles):
-            # Obstacles are static, so we only need their positions from the first frame
-            ox = float(states_viz[0, 6 + 2 * i])
-            oy = float(states_viz[0, 7 + 2 * i])
-            if np.isfinite(ox) and np.isfinite(oy):
-                obstacles_xy.append((ox, oy))
 
         import matplotlib
 
@@ -202,43 +272,13 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
         from matplotlib.patches import Circle, Polygon, Rectangle
         from PIL import Image
 
-        # Geometry
-        BLOCK_HALF = 0.025
-        CIRCLE_RADIUS = 0.025
-        STICK_RADIUS = 0.01
-        OBSTACLE_RADIUS = 0.018
-
-        pad = 0.02
-        x_min = min(tcp_xy[:, 0].min(), block_xy[:, 0].min()) - pad
-        x_max = max(tcp_xy[:, 0].max(), block_xy[:, 0].max()) + pad
-        y_min = min(tcp_xy[:, 1].min(), block_xy[:, 1].min()) - pad
-        y_max = max(tcp_xy[:, 1].max(), block_xy[:, 1].max()) + pad
-
-        if start_marker is not None and np.all(np.isfinite(start_marker)):
-            x_min = min(x_min, float(start_marker[0]) - pad)
-            x_max = max(x_max, float(start_marker[0]) + pad)
-            y_min = min(y_min, float(start_marker[1]) - pad)
-            y_max = max(y_max, float(start_marker[1]) + pad)
-        if goal_marker is not None and np.all(np.isfinite(goal_marker)):
-            x_min = min(x_min, float(goal_marker[0]) - pad)
-            x_max = max(x_max, float(goal_marker[0]) + pad)
-            y_min = min(y_min, float(goal_marker[1]) - pad)
-            y_max = max(y_max, float(goal_marker[1]) + pad)
-
-        # --- Expand limits to include obstacles ---
-        for ox, oy in obstacles_xy:
-            x_min = min(x_min, ox - OBSTACLE_RADIUS - pad)
-            x_max = max(x_max, ox + OBSTACLE_RADIUS + pad)
-            y_min = min(y_min, oy - OBSTACLE_RADIUS - pad)
-            y_max = max(y_max, oy + OBSTACLE_RADIUS + pad)
-
-        if (
-            not all(np.isfinite(v) for v in (x_min, x_max, y_min, y_max))
-            or x_min >= x_max
-            or y_min >= y_max
-        ):
-            x_min, x_max = -0.35, 0.35
-            y_min, y_max = -0.35, 0.35
+        x_min, x_max, y_min, y_max = _pushboundary_2d_viz_limits(
+            tcp_xy=tcp_xy,
+            block_xy=block_xy,
+            obstacles_xy=obstacles_xy,
+            start_marker=start_marker,
+            goal_marker=goal_marker,
+        )
 
         T = states.shape[0]
         n_include = T
@@ -264,7 +304,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 ax.add_patch(
                     Circle(
                         (ox, oy),
-                        radius=OBSTACLE_RADIUS,
+                        radius=_PUSHBOUNDARY_OBSTACLE_RADIUS,
                         facecolor="dimgray",
                         edgecolor="black",
                         linewidth=1,
@@ -278,7 +318,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             ax.add_patch(
                 Circle(
                     (tcp_now[0], tcp_now[1]),
-                    radius=STICK_RADIUS,
+                    radius=_PUSHBOUNDARY_STICK_RADIUS,
                     facecolor="#e63946",
                     edgecolor="#c1121f",
                     linewidth=1,
@@ -289,7 +329,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
                 ax.add_patch(
                     Circle(
                         (block_now[0], block_now[1]),
-                        radius=CIRCLE_RADIUS,
+                        radius=_PUSHBOUNDARY_CIRCLE_RADIUS,
                         facecolor="#0066ff",
                         edgecolor="#0047ab",
                         linewidth=1,
@@ -299,7 +339,7 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             elif block_yaws is not None:
                 yaw = block_yaws[end - 1]
                 c, s_val = np.cos(yaw), np.sin(yaw)
-                h = BLOCK_HALF
+                h = _PUSHBOUNDARY_BLOCK_HALF
                 local = [(-h, -h), (h, -h), (h, h), (-h, h)]
                 corners = [
                     (
@@ -321,9 +361,12 @@ class DiffusionForcingPlanning(DiffusionForcingBase):
             else:
                 ax.add_patch(
                     Rectangle(
-                        (block_now[0] - BLOCK_HALF, block_now[1] - BLOCK_HALF),
-                        width=2 * BLOCK_HALF,
-                        height=2 * BLOCK_HALF,
+                        (
+                            block_now[0] - _PUSHBOUNDARY_BLOCK_HALF,
+                            block_now[1] - _PUSHBOUNDARY_BLOCK_HALF,
+                        ),
+                        width=2 * _PUSHBOUNDARY_BLOCK_HALF,
+                        height=2 * _PUSHBOUNDARY_BLOCK_HALF,
                         facecolor="#0066ff",
                         edgecolor="#0047ab",
                         linewidth=1,
