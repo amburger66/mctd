@@ -11,6 +11,8 @@ dql_jobs/
 
 inference_results/
 inference/
+inference_562j5rbm/
+inference_block/
 inference_cylinder/
 
 visualizations/
@@ -168,3 +170,6 @@ checkpoints
 # Pycharm setting
 .idea/
 data/*
+
+# inference results
+inference_block/

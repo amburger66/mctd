@@ -4,23 +4,49 @@ import torch
 import torch.nn
 
 class TreeNode():
-    def __init__(self, name, depth, parent_node, children_node_guidance_scales, plan_history, guidance_scale=None, terminal_depth=None, 
-            value=None, value_estimation_plan=None, virtual_visit_weight=0.0, noise_state=None, committed_plan=None):
+    # def __init__(self, name, depth, parent_node, children_node_guidance_scales, plan_history, guidance_scale=None, terminal_depth=None, 
+    #         value=None, value_estimation_plan=None, virtual_visit_weight=0.0, noise_state=None, committed_plan=None):
+    #     self.name = name
+    #     self.depth = depth
+    #     self._parent_node = parent_node
+    #     self._children_node_guidance_scales = children_node_guidance_scales
+    #     self.plan_history = plan_history
+    #     self.guidance_scale = guidance_scale
+    #     self.terminal_depth = terminal_depth
+    #     self.virtual_visit_weight = virtual_visit_weight
+    #     self.virtual_visit_count = 0
+    #     # The maximum number of children nodes is same to the number of children node guidances
+    #     self._children_nodes = [
+    #         {'guidance_scale': self._children_node_guidance_scales[i], 'node': None, "virtually_visited": False}
+    #         for i in range(len(self._children_node_guidance_scales))
+    #     ]
+
+    #     self.value = value
+    #     self.value_estimation_plan = value_estimation_plan
+    #     self.visit_count = 0
+    #     self.noise_state = noise_state
+    #     self.committed_plan = committed_plan
+        
+    def __init__(self, name, depth, parent_node, children_node_guidance_scales, plan_history,
+             guidance_scale=None, plan_tokens=None, tokens_committed=0, stable_prefix=None,
+             value=None, value_estimation_plan=None, virtual_visit_weight=0.0,
+             noise_state=None, committed_plan=None):
         self.name = name
         self.depth = depth
         self._parent_node = parent_node
         self._children_node_guidance_scales = children_node_guidance_scales
         self.plan_history = plan_history
         self.guidance_scale = guidance_scale
-        self.terminal_depth = terminal_depth
+        self.plan_tokens = plan_tokens
+        self.tokens_committed = tokens_committed
+        self.stable_prefix = stable_prefix          # how many tokens THIS node's expansion committed
+        self.children_stable_prefix = None          # set after simulation; used for child expansions
         self.virtual_visit_weight = virtual_visit_weight
         self.virtual_visit_count = 0
-        # The maximum number of children nodes is same to the number of children node guidances
         self._children_nodes = [
             {'guidance_scale': self._children_node_guidance_scales[i], 'node': None, "virtually_visited": False}
             for i in range(len(self._children_node_guidance_scales))
         ]
-
         self.value = value
         self.value_estimation_plan = value_estimation_plan
         self.visit_count = 0
@@ -41,13 +67,13 @@ class TreeNode():
             return False
         return True
     
-    def is_expandable(self, consider_virtually_visited=False):
-        if self.depth == self.terminal_depth:
-            return False
-        for child_node in self._children_nodes:
-            if child_node["node"] is None and (not consider_virtually_visited or not child_node["virtually_visited"]):
-                return True
-        return False
+    # def is_expandable(self, consider_virtually_visited=False):
+    #     if self.depth == self.terminal_depth:
+    #         return False
+    #     for child_node in self._children_nodes:
+    #         if child_node["node"] is None and (not consider_virtually_visited or not child_node["virtually_visited"]):
+    #             return True
+    #     return False
 
     def is_selectable(self):
         for child_node in self._children_nodes:
@@ -55,10 +81,21 @@ class TreeNode():
                 return False
         return True
 
-    def is_terminal(self):
-        if self.depth == self.terminal_depth:
-            return True
+    # def is_terminal(self):
+    #     if self.depth == self.terminal_depth:
+    #         return True
+    #     return False
+    
+    def is_expandable(self, consider_virtually_visited=False):
+        if self.tokens_committed >= self.plan_tokens:
+            return False
+        for child_node in self._children_nodes:
+            if child_node["node"] is None and (not consider_virtually_visited or not child_node["virtually_visited"]):
+                return True
         return False
+
+    def is_terminal(self):
+        return self.tokens_committed >= self.plan_tokens
     
     def set_value(self, value):
         self.value = value
@@ -97,15 +134,46 @@ class TreeNode():
             self._children_nodes[selected_index]['virtually_visited'] = False # virtually visit flag is False when the node is created
         return self._children_nodes[selected_index]['node']
 
+    # def get_expandable_candidate(self, index=None, consider_virtually_visited=False):
+    #     if index is None:
+    #         remaining_children_indices = [
+    #             i for i in range(len(self._children_nodes)) if self._children_nodes[i]['node'] is None and (not consider_virtually_visited or not self._children_nodes[i]['virtually_visited'])
+    #         ]
+    #         #selected_index = remaining_children_indices[0] # To check the best-of-n MCTD
+    #         selected_index = np.random.choice(remaining_children_indices)
+    #     else:
+    #         selected_index = index
+    #     candidate_info = {
+    #         'name': self.name + f'-{selected_index}',
+    #         'depth': self.depth + 1,
+    #         'parent_node': self,
+    #         'children_node_guidance_scales': self._children_node_guidance_scales,
+    #         'plan_history': self.plan_history.copy(),
+    #         'guidance_scale': self._children_nodes[selected_index]['guidance_scale'],
+    #         'value': None,
+    #         'value_estimation_plan': None,
+    #         'virtual_visit_weight': self.virtual_visit_weight
+    #     }
+    #     # this function call means that the node is virtually visited in parallel search
+    #     self._children_nodes[selected_index]['virtually_visited'] = True
+    #     return candidate_info
+    
     def get_expandable_candidate(self, index=None, consider_virtually_visited=False):
         if index is None:
             remaining_children_indices = [
-                i for i in range(len(self._children_nodes)) if self._children_nodes[i]['node'] is None and (not consider_virtually_visited or not self._children_nodes[i]['virtually_visited'])
+                i for i in range(len(self._children_nodes))
+                if self._children_nodes[i]['node'] is None
+                and (not consider_virtually_visited or not self._children_nodes[i]['virtually_visited'])
             ]
-            #selected_index = remaining_children_indices[0] # To check the best-of-n MCTD
             selected_index = np.random.choice(remaining_children_indices)
         else:
             selected_index = index
+
+        # Determine how many tokens this child's expansion will commit
+        remaining = self.plan_tokens - self.tokens_committed
+        s = self.children_stable_prefix if self.children_stable_prefix is not None else remaining
+        s = min(s, remaining)  # clamp
+
         candidate_info = {
             'name': self.name + f'-{selected_index}',
             'depth': self.depth + 1,
@@ -113,11 +181,13 @@ class TreeNode():
             'children_node_guidance_scales': self._children_node_guidance_scales,
             'plan_history': self.plan_history.copy(),
             'guidance_scale': self._children_nodes[selected_index]['guidance_scale'],
+            'plan_tokens': self.plan_tokens,
+            'tokens_committed': self.tokens_committed + s,
+            'stable_prefix': s,
             'value': None,
             'value_estimation_plan': None,
-            'virtual_visit_weight': self.virtual_visit_weight
+            'virtual_visit_weight': self.virtual_visit_weight,
         }
-        # this function call means that the node is virtually visited in parallel search
         self._children_nodes[selected_index]['virtually_visited'] = True
         return candidate_info
 

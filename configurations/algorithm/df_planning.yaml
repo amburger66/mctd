@@ -52,6 +52,9 @@ leaf_parallelization: False
 parallel_multiple_visits: False
 early_stopping_condition: "solved"
 num_tries_for_bad_plans: 10
+# Mean pairwise L2 distance in unnormalized obs space between value-estimation plans.
+# null disables the computation.
+mctd_pairwise_divergence_threshold: 0.5
 sub_goal_interval: 10
 viz_plans: False
 # 2D PushBoundary GIF: block geometry in BEV ("square" or "circle").
@@ -60,11 +63,15 @@ viz_block_shape: square
 # without executing it in an environment (placeholder for ManiSkill hookup).
 no_sim_env: false
 
+viz_mctd_batch_plans: False
+viz_mctd_batch_plans_out_dir: viz/mctd2
+viz_mctd_batch_plans_every_n_search: 1
+
 diffusion:
   stabilization_level: 10
   beta_schedule: linear
   objective: pred_x0
-  ddim_sampling_eta: 0.0
+  ddim_sampling_eta: 0.1
   architecture:
     network_size: 128
     num_layers: 12
